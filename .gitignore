@@ -1,0 +1,10 @@
+.gradle/
+build/
+**/build/
+bin/
+**/bin/
+out/
+.env
+*.iml
+.idea/
+/Backend_Take_Home_E_Library_Service Chinese.docx

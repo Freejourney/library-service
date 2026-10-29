@@ -1,0 +1,7 @@
+spring:
+  config:
+    import: elibrary-common.yml
+  application:
+    name: ${APP_NAME:elibrary-lending}
+server:
+  port: ${PORT:8083}

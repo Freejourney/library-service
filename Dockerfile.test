@@ -1,0 +1,23 @@
+# 测试阶段镜像：构建并运行某个服务的单元测试与集成测试
+# docker build --build-arg SERVICE=lending -f Dockerfile.test .
+FROM gradle:8.10.2-jdk21 AS test
+WORKDIR /workspace
+
+ARG SERVICE=lending
+ENV SERVICE=${SERVICE}
+
+COPY settings.gradle build.gradle gradlew gradlew.bat ./
+COPY gradle ./gradle
+COPY common/build.gradle ./common/build.gradle
+COPY account/build.gradle ./account/build.gradle
+COPY catalog/build.gradle ./catalog/build.gradle
+COPY lending/build.gradle ./lending/build.gradle
+RUN gradle --no-daemon --console=plain dependencies > /dev/null 2>&1 || true
+
+COPY common ./common
+COPY account ./account
+COPY catalog ./catalog
+COPY lending ./lending
+
+# 测试入口：默认运行指定模块的测试；集成测试无 docker.sock 时自动跳过
+ENTRYPOINT ["sh", "-c", "gradle --no-daemon --console=plain :${SERVICE}:test ${TEST_ARGS}"]

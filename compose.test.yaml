@@ -1,0 +1,42 @@
+# 测试环境：MySQL 8.4 + 测试运行容器
+# 用法: SERVICE=account docker compose -f compose.test.yaml run --rm test
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: elibrary_db
+      MYSQL_USER: elibrary
+      MYSQL_PASSWORD: ${DB_PASSWORD:-elibrary-local}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root-local}
+      TZ: UTC
+    ports: ["13306:3306"]
+    volumes: [mysql-test-data:/var/lib/mysql]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-p${MYSQL_ROOT_PASSWORD:-root-local}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+      args:
+        SERVICE: ${SERVICE:-lending}
+    depends_on:
+      mysql: { condition: service_healthy }
+    environment:
+      DB_URL: jdbc:mysql://mysql:3306/elibrary_db?connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true
+      DB_USERNAME: elibrary
+      DB_PASSWORD: ${DB_PASSWORD:-elibrary-local}
+      JWT_ISSUER_URI: https://issuer.example.test
+      JWT_JWK_SET_URI: https://localhost:9443/jwks
+      JWT_AUDIENCE: elibrary-test
+      TEST_ARGS: ${TEST_ARGS:-}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro   # 无 docker.sock 时集成测试自动跳过
+      - gradle-cache:/home/gradle/.gradle
+
+volumes:
+  mysql-test-data:
+  gradle-cache:

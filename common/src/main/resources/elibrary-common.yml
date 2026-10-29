@@ -1,0 +1,42 @@
+server:
+  forward-headers-strategy: framework
+spring:
+  datasource:
+    url: ${DB_URL:jdbc:mysql://localhost:3306/elibrary_db?connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true}
+    username: ${DB_USERNAME:elibrary}
+    password: ${DB_PASSWORD:elibrary-local}
+    hikari:
+      connection-init-sql: SET time_zone = '+00:00'
+  flyway:
+    enabled: true
+  jackson:
+    time-zone: UTC
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: ${JWT_ISSUER_URI:https://issuer.example.com}
+          jwk-set-uri: ${JWT_JWK_SET_URI:}
+          audiences: ${JWT_AUDIENCE:elibrary-api}
+mybatis:
+  type-handlers-package: com.elibrary.common
+  configuration:
+    map-underscore-to-camel-case: true
+    jdbc-type-for-null: 'NULL'
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+elibrary:
+  loan:
+    max-active: ${LOAN_MAX_ACTIVE:5}
+    days: ${LOAN_DAYS:14}
+    due-time: ${LOAN_DUE_TIME:23:59:00}
+    zone: ${LIBRARY_ZONE:Asia/Shanghai}
+    policy-version: ${LOAN_POLICY_VERSION:v1}
+    idempotency-retention-days: ${IDEMPOTENCY_RETENTION_DAYS:7}

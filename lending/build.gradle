@@ -1,0 +1,26 @@
+plugins {
+    id 'org.springframework.boot'
+}
+
+dependencies {
+    api project(':common')
+    implementation project(':account')
+    implementation project(':catalog')
+    testImplementation project(':common')
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    testImplementation 'org.testcontainers:mysql:1.20.3'
+    testImplementation 'org.testcontainers:junit-jupiter:1.20.3'
+    testImplementation 'com.tngtech.archunit:archunit-junit5:1.3.0'
+}
+
+springBoot {
+    mainClass = 'com.elibrary.lending.LendingApplication'
+}
+
+tasks.named('bootJar') {
+    archiveFileName = 'lending-app.jar'
+}
+
+tasks.named('bootRun') {
+    mainClass = 'com.elibrary.lending.LendingApplication'
+}

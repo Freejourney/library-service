@@ -1,0 +1,17 @@
+plugins {
+    id 'org.springframework.boot'
+}
+
+dependencies {
+    api project(':common')
+    testImplementation project(':common')
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+}
+
+springBoot {
+    mainClass = 'com.elibrary.catalog.CatalogApplication'
+}
+
+tasks.named('bootJar') {
+    archiveFileName = 'catalog-app.jar'
+}

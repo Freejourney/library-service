@@ -1,0 +1,55 @@
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: elibrary_db
+      MYSQL_USER: elibrary
+      MYSQL_PASSWORD: ${DB_PASSWORD:-elibrary-local}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root-local}
+      TZ: UTC
+    ports: ["3306:3306"]
+    volumes: [mysql-data:/var/lib/mysql]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-p${MYSQL_ROOT_PASSWORD:-root-local}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  account:
+    build:
+      context: .
+      args:
+        SERVICE: account
+    depends_on:
+      mysql: { condition: service_healthy }
+    environment: &app-env
+      DB_URL: jdbc:mysql://mysql:3306/elibrary_db?connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true
+      DB_USERNAME: elibrary
+      DB_PASSWORD: ${DB_PASSWORD:-elibrary-local}
+      JWT_ISSUER_URI: ${JWT_ISSUER_URI:-https://issuer.example.com}
+      JWT_JWK_SET_URI: ${JWT_JWK_SET_URI:-}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-elibrary-api}
+    ports: ["8081:8081"]
+
+  catalog:
+    build:
+      context: .
+      args:
+        SERVICE: catalog
+    depends_on:
+      mysql: { condition: service_healthy }
+    environment: *app-env
+    ports: ["8082:8082"]
+
+  lending:
+    build:
+      context: .
+      args:
+        SERVICE: lending
+    depends_on:
+      mysql: { condition: service_healthy }
+    environment: *app-env
+    ports: ["8083:8083"]
+
+volumes:
+  mysql-data:
