@@ -7,7 +7,7 @@
 
 ## 1. MVP 范围与原则
 
-MVP 采用模块化单体和单个 MySQL 数据库，覆盖核心业务：账号资格查询、目录浏览/检索/详情、借阅、归还和个人借阅记录。数据在同库事务内维护，保证借阅、库存和幂等结果一致。
+MVP 采用**模块化微服务**（common 共享工程 + account / catalog / lending 三个独立服务）和单个 MySQL 数据库，覆盖核心业务：账号资格查询、目录浏览/检索/详情、借阅、归还和个人借阅记录。数据在同库事务内维护，保证借阅、库存和幂等结果一致。
 
 本期不包含注册/登录/凭证管理（由 OIDC 提供方承接）、馆员后台与馆藏维护、通知、阅读器与正文访问、预约、续借和罚金。
 
@@ -27,32 +27,52 @@ MVP 采用模块化单体和单个 MySQL 数据库，覆盖核心业务：账号
 
 ## 2. 架构总览
 
+MVP 采用**模块化微服务**：`common` 共享工程 + `account` / `catalog` / `lending` 三个独立可部署的 Spring Boot 服务，共享单个 MySQL 数据库（同库事务保证借阅/库存/幂等一致）。
+
 ```text
 读者端
   │  HTTPS (JWT)
   ▼
 Nginx / 云 LB（TLS、限流、路由）
   │
-  ▼
-┌──────────────────────────────────────────────┐
-│  elibrary-app（Java 21 + Spring Boot 3 单体） │
-│  ┌──────────┐ ┌──────────┐ ┌───────────────┐ │
-│  │ account  │ │ catalog  │ │   lending     │ │
-│  │ module   │ │ module   │ │   module      │ │
-│  └──────────┘ └──────────┘ └───────────────┘ │
-│  OAuth2 Resource Server（校验 OIDC 签发的 JWT）│
-└──────────────────────┬───────────────────────┘
-                       ▼
-                MySQL 8.4 / InnoDB（单库 elibrary_db）
+  ├──────────────┬──────────────┬──────────────┐
+  ▼              ▼              ▼              ▼
+┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────────┐
+│ account  │ │ catalog  │ │ lending  │ │      common      │
+│ :8081    │ │ :8082    │ │ :8083    │ │  （共享工程）     │
+│ Spring   │ │ Spring   │ │ Spring   │ │  契约/配置/基础   │
+│ Boot 3   │ │ Boot 3   │ │ Boot 3   │ │  AutoConfiguration│
+└────┬─────┘ └────┬─────┘ └────┬─────┘ └──────────────────┘
+     │            │            │
+     └────────────┴────────────┴────────────┐
+                                            ▼
+                          MySQL 8.4 / InnoDB（单库 elibrary_db）
 ```
+
+- 每个业务模块是**独立进程**（独立端口、独立启动类、独立 `bootJar`），可单独部署/扩容。
+- 三个服务共享 `common` 工程：统一响应/异常/分页、JWT 资源服务器、时钟、Flyway 迁移、借阅策略配置、MyBatis UUID 处理器。
+- 跨模块调用通过 **Java 接口（端口）** 完成，实现类由各服务按需装配（Spring `@Import` / AutoConfiguration），沿模块边界即可拆分为独立部署单元。
 
 ### 模块职责与边界
 
 - **account**：读取账号状态与借阅资格；账号的创建/冻结/注销由受信任渠道（运维脚本或内部管理工具直接调用应用服务/SQL）完成，不开放读者 API。
 - **catalog**：分类、目录条目、搜索、详情、上下架状态。
 - **lending**：借阅、归还、规则校验、幂等、个人借阅记录。
+- **common**：跨模块共享契约与基础设施（见下）。
 
-**模块间规则**：模块之间只通过 Java 接口（Application Service）调用，**不直接访问对方的 Repository/表**。这样将来需要拆服务时，沿模块边界切即可。
+**模块间规则**：模块之间只通过 Java 接口（Application Service 端口）调用，**不直接访问对方的 Repository/表**。这样将来需要拆服务时，沿模块边界切即可。
+
+### 模块间端口契约
+
+| 端口 | 定义位置 | 实现位置 | 用途 |
+|---|---|---|---|
+| `AccountAccessPort` | account.application | account.infrastructure.AccountRepository | 账号读取/行锁（借阅事务内串行化读者） |
+| `LoanCountPort` | account.application | account 默认 `LoanCountReader`；lending `@Primary` `LoanCountService` | 有效/逾期借阅计数（资格展示） |
+| `CatalogReadPort` | catalog.application | catalog.infrastructure.CatalogItemRepository | 条目读取/行锁/检索 |
+| `CatalogInventoryPort` | catalog.application | catalog.application.CatalogInventoryService | 库存增减（借出 -1 / 归还 +1） |
+| `LendingPolicyPort` | common | common 默认 `ConfiguredLendingPolicy`；lending `@Primary` `LendingPolicyService` | 借阅规则视图（详情展示） |
+
+> 默认实现 + `@Primary` 覆盖：服务独立运行时使用默认实现；lending 服务内使用精确实现，保证统计口径一致。
 
 ### 技术栈
 
@@ -60,12 +80,13 @@ Nginx / 云 LB（TLS、限流、路由）
 |---|---|---|
 | 语言/框架 | Java 21 + Spring Boot 3（Spring MVC） | I/O + 事务型业务，阻塞模型更直观 |
 | 持久化 | MySQL 8.4 LTS + InnoDB + MyBatis | 借阅 SQL 显式控制 `FOR UPDATE` |
-| 构建 | Gradle Wrapper | 固定 Gradle 构建版本 |
-| 迁移 | Flyway | 禁止生产自动建表 |
+| 构建 | Gradle Wrapper（多模块工程） | `common` + `account` + `catalog` + `lending` |
+| 迁移 | Flyway（common 内共享迁移脚本） | 禁止生产自动建表 |
 | 认证 | Spring Security OAuth2 Resource Server | 校验 issuer/audience/exp，取 `sub` 作为 `accountId` |
 | 校验/文档 | Bean Validation + OpenAPI 3 | |
 | 可观测 | Spring Actuator + Micrometer/Prometheus；JSON 日志 + `traceId` | 保留最小闭环 |
 | 测试 | JUnit 5 + Testcontainers（MySQL 8.4） | **并发与锁测试必须用真实 MySQL，不用 H2** |
+| 部署 | Docker（`--build-arg SERVICE` 单服务镜像）+ Docker Compose | 本地开发：MySQL 在 Docker，服务在 JVM |
 
 ### 通用约定
 
@@ -73,6 +94,8 @@ Nginx / 云 LB（TLS、限流、路由）
 - 主键：UUIDv7（`BINARY(16)`）。
 - 事务隔离级别：`READ COMMITTED`，显式配置。
 - 字符集：`utf8mb4` / `utf8mb4_0900_ai_ci`。
+- 包名：`com.elibrary.{module}`（`common` 为 `com.elibrary.common` / `com.elibrary.config`）。
+- 服务端口：account `8081`、catalog `8082`、lending `8083`（可经 `PORT` 环境变量覆盖）。
 
 ---
 
@@ -380,32 +403,47 @@ Base Path：`/api/v1`；JSON UTF-8。共 9 个对外接口。
 
 ## 6. 代码结构
 
-单仓库、单可部署产物，按**业务能力**分包，每个模块内部沿用 Clean Architecture 分层：
+多模块 Gradle 工程，按**业务能力**拆分为四个模块，每个业务模块内部沿用 Clean Architecture 分层：
 
 ```text
-elibrary-app/
-  src/main/java/com/example/elibrary/
-    account/
-      api/            # AccountController、DTO
-      application/    # GetMyAccount、CheckBorrowingEligibility（供 lending 调用的接口）
+elibrary-app/                          # 根：Gradle 多模块工程
+  settings.gradle                      # include common/account/catalog/lending
+  build.gradle                         # 公共构建配置（java-library + dependency-management）
+  common/
+    src/main/java/com/elibrary/
+      common/                          # 统一响应/异常/分页、Ids、Times、Maps、Subjects、TraceFilter、UuidTypeHandler
+      config/                          # Security(JWT)、TimeConfig、LoanProperties、ConfiguredLendingPolicy、ElibraryCommonAutoConfiguration
+    src/main/resources/
+      elibrary-common.yml              # 共享配置（数据源/JWT/MyBatis/借阅策略）
+      db/migration/V1__init.sql        # Flyway 迁移（共享）
+  account/
+    src/main/java/com/elibrary/account/
+      AccountApplication.java          # 独立启动类（:8081）
+      api/            # AccountController
+      application/    # AccountApplicationService、AccountAccessPort、LoanCountPort、LoanCountReader
       domain/         # ReaderAccount、AccountStatus
-      infrastructure/ # MyBatis Mapper、Repository 实现
-    catalog/
+      infrastructure/ # AccountMapper、AccountRepository、AccountRow、LoanCountMapper
+    src/main/resources/application.yml # 端口/名称（import elibrary-common.yml）
+  catalog/
+    src/main/java/com/elibrary/catalog/
+      CatalogApplication.java          # 独立启动类（:8082）
       api/            # BookController、CategoryController
-      application/    # SearchBooks、GetBook、ListCategories、LockItemForLending（供 lending 调用）
-      domain/         # CatalogItem、SearchCriteria
-      infrastructure/ # MyBatis Mapper、Repository 实现、搜索文本规范化（NFKC）
-    lending/
-      api/            # LoanController、OperationController
-      application/    # BorrowLoan、ReturnLoan、ListReaderLoans、GetLoan、GetOperation
-      domain/         # Loan、LoanPolicy、DueDateCalculator、领域异常
-      infrastructure/ # MyBatis Mapper、LoanRepository、IdempotencyRepository
-    common/           # 统一响应/异常、ErrorCode、分页、Clock、TraceId、安全上下文
-    config/           # Security(JWT)、Clock/ZoneId、LoanPolicyProperties、事务隔离级别
-  src/main/resources/db/migration/   # Flyway：V1__init.sql ...
-  build.gradle                       # Gradle 构建配置
-  Dockerfile                         # 应用容器镜像
-  compose.yaml                       # 本地 app + MySQL 环境
+      application/    # CatalogApplicationService、CatalogReadPort、CatalogInventoryPort、SearchCriteria
+      domain/         # CatalogItem、Category、ShelfStatus
+      infrastructure/ # CatalogMapper、CatalogItemRepository、ItemRow、CategoryRow
+    src/main/resources/application.yml
+  lending/
+    src/main/java/com/elibrary/lending/
+      LendingApplication.java          # 独立启动类（:8083）
+      api/            # LoanController、OperationController、UserLoansController
+      application/    # BorrowLoan、ReturnLoan、LoanQueryService、IdempotencyService、LoanCountService、LendingPolicyService
+      domain/         # Loan、LoanPolicy、DueDateCalculator
+      infrastructure/ # LoanMapper、IdempotencyMapper、LoanRow、IdempotencyRow
+    src/main/resources/application.yml
+  Dockerfile                           # 单服务镜像（--build-arg SERVICE）
+  Dockerfile.test                      # 测试镜像
+  compose.yaml                         # mysql + account + catalog + lending
+  compose.test.yaml                    # 测试环境
   src/test/java/.../{domain,application,integration}
 ```
 
@@ -416,6 +454,226 @@ elibrary-app/
 - `BorrowLoan`、`ReturnLoan` 各是一个 `@Transactional` 用例；提交前任何异常即整体回滚，**不要吞异常后继续提交**。
 - `Clock` 与 `ZoneId` 注入，便于测试固定时间。
 - 不为简单 CRUD 引入过度抽象。
+- 跨模块 Bean 装配：common 通过 `ElibraryCommonAutoConfiguration`（AutoConfiguration）自动加载共享基础设施；lending 通过 `@Import` 引入 account/catalog 的 Repository 实现。
+
+---
+
+## 6.1 领域驱动模型
+
+### 限界上下文（Bounded Context）
+
+按业务能力划分三个限界上下文，各自拥有独立的领域模型、语言与数据访问：
+
+```text
+┌─────────────────────┐   ┌─────────────────────┐   ┌─────────────────────┐
+│  account 上下文      │   │  catalog 上下文      │   │  lending 上下文      │
+│  ReaderAccount      │   │  CatalogItem        │   │  Loan               │
+│  AccountStatus      │   │  Category           │   │  LoanPolicy         │
+│                     │   │  ShelfStatus        │   │  DueDateCalculator  │
+└─────────┬───────────┘   └─────────┬───────────┘   └─────────┬───────────┘
+          │                        │                         │
+          └────────────────────────┴─────────────────────────┘
+                    共享：common（契约/配置/基础设施）
+```
+
+- **account**：账号生命周期与借阅资格。领域语言：`ReaderAccount`、`AccountStatus`（NORMAL/FROZEN/PENDING_VERIFICATION/DELETED）、资格。
+- **catalog**：目录与库存视图。领域语言：`CatalogItem`、`Category`、`ShelfStatus`（ON_SHELF/OFF_SHELF/REMOVED）、可借数。
+- **lending**：借阅生命周期与规则。领域语言：`Loan`、`LoanPolicy`、`DueDateCalculator`、逾期（读时派生）。
+
+### 聚合根（Aggregate Root）
+
+| 聚合 | 聚合根 | 不变量（Invariant） |
+|---|---|---|
+| 账号 | `ReaderAccount` | 状态决定资格；冻结/注销/待核验禁止新借 |
+| 目录条目 | `CatalogItem` | `available_copies <= total_copies`；REMOVED 为终态 |
+| 借阅 | `Loan` | 同一读者同一书仅一条有效借阅（`uk_active_account_item`）；`due_at > borrowed_at` |
+
+- 聚合内一致性由**数据库约束兜底**（唯一约束、CHECK 约束），应用层先行校验。
+- 跨聚合一致性（借阅 + 库存 + 幂等）在**同一本地事务**内完成，不引入分布式事务。
+
+### 领域服务（Domain Service）
+
+无状态、表达用例编排的领域服务：
+
+| 领域服务 | 所属上下文 | 职责 |
+|---|---|---|
+| `DueDateCalculator` | lending | 应还时间计算（本地日历加日，正确处理月末/闰日/夏令时） |
+| `BorrowLoan` | lending | 借阅用例编排（幂等 → 锁读者 → 规则校验 → 锁条目 → 插 Loan + 扣库存） |
+| `ReturnLoan` | lending | 归还用例编排（锁 Loan → 写归还 → 回补库存） |
+| `AccountApplicationService` | account | 账号资格查询 |
+| `CatalogApplicationService` | catalog | 目录检索/详情 |
+
+### 领域事件（Domain Event，MVP 最小集）
+
+MVP 不引入事件总线/Outbox。借还结果通过**幂等记录**（`idempotency_records`）持久化终态，供结果查询与重放；未来演进（通知/预约/罚金）时沿模块边界引入事件。
+
+### 依赖方向与端口（Ports & Adapters）
+
+```text
+api (Controller)  →  application (用例/端口)  →  domain (纯领域)
+                        │  ▲
+                        ▼  │
+                 infrastructure (Mapper/Repository 实现端口)
+```
+
+- **依赖方向**：`api → application → domain`；`infrastructure` 实现 `application` 声明的端口；`domain` 不依赖任何外部框架。
+- **跨上下文**：只允许 `lending → account/catalog`（通过端口接口），禁止反向依赖；`common` 提供跨上下文共享契约（如 `LendingPolicyPort`）。
+- **事务边界**：`BorrowLoan` / `ReturnLoan` 是 `@Transactional` 用例，事务从用例方法开始，提交前任何异常整体回滚。
+
+---
+
+## 6.2 错误处理
+
+### 错误码体系
+
+错误码是**机器可读的稳定标识**，HTTP 状态码仅表达语义类别。客户端应依赖错误码而非状态码做分支。
+
+| 错误码 | HTTP | 含义 | 触发点 |
+|---|---:|---|---|
+| `INVALID_REQUEST` / `INVALID_QUERY` / `INVALID_ID` / `INVALID_IDEMPOTENCY_KEY` | 400 | 参数、分页、排序、关键词（>100 字符）等无效 | Controller 校验 / 应用层 |
+| `UNAUTHENTICATED` | 401 | 缺少/无效/过期 Token | Security 过滤器 |
+| `FORBIDDEN` | 403 | 已认证但无权限（预留） | Security 过滤器 |
+| `ACCOUNT_NOT_ELIGIBLE` | 403 | 账号冻结、注销或未核验 | BorrowLoan |
+| `ACCOUNT_NOT_FOUND` / `BOOK_NOT_FOUND` / `LOAN_NOT_FOUND` / `OPERATION_NOT_FOUND` | 404 | 资源不存在；非本人记录统一隐藏为 404 | 各查询/用例 |
+| `OVERDUE_LOANS_EXIST` | 409 | 存在未归还逾期项 | BorrowLoan |
+| `LOAN_LIMIT_EXCEEDED` | 409 | 已持有 5 项有效借阅 | BorrowLoan |
+| `DUPLICATE_ACTIVE_LOAN` | 409 | 已有效借阅同一条目 | BorrowLoan（含唯一约束兜底） |
+| `BOOK_UNAVAILABLE` | 409 | 已下架、无可用名额或最后名额已被取走 | BorrowLoan |
+| `LOAN_ALREADY_RETURNED` / `LOAN_NOT_RETURNABLE` | 409 | 已完成或当前状态不可归还 | ReturnLoan |
+| `IDEMPOTENCY_KEY_REUSED` | 409 | 相同 key 对应不同请求内容 | IdempotencyService |
+| `DEPENDENCY_UNAVAILABLE` | 503 | 数据库等不可用 | ApiErrorHandler（DataAccessException） |
+| `INTERNAL_ERROR` | 500 | 未预期错误 | ApiErrorHandler（兜底） |
+
+### 异常层次
+
+```text
+RuntimeException
+ └── ApiException                    # 业务/参数错误：status + code + message
+      ├── 400 系列：INVALID_*        # 由 Ids.parse / 校验 / 应用层抛出
+      ├── 403 系列：ACCOUNT_NOT_ELIGIBLE
+      ├── 404 系列：*_NOT_FOUND      # ApiException.notFound(code)
+      └── 409 系列：*_CONFLICT       # ApiException.conflict(code)
+```
+
+- **`ApiException`**（common）：携带 `status` / `code` / `message`，是应用层表达业务拒绝的唯一异常类型。
+- **框架异常**（`MethodArgumentNotValidException`、`HttpMessageNotReadableException`、`MethodArgumentTypeMismatchException`）：由全局处理器映射为 `400 INVALID_REQUEST`。
+- **基础设施异常**（`DataAccessException`、`DuplicateKeyException`）：`DuplicateKeyException` 在用例内捕获并映射为业务冲突（如 `DUPLICATE_ACTIVE_LOAN`）；其余 `DataAccessException` 由全局处理器映射为 `503 DEPENDENCY_UNAVAILABLE`。
+- **未预期异常**：兜底映射为 `500 INTERNAL_ERROR`，仅记录日志，不向客户端泄露堆栈/SQL/Token。
+
+### 全局异常处理（ApiErrorHandler）
+
+`@RestControllerAdvice` 统一处理，保证**所有响应格式一致**：
+
+```json
+{"code":"BOOK_UNAVAILABLE","message":"Book is unavailable","details":{},"timestamp":"...","traceId":"..."}
+```
+
+处理顺序（优先级从高到低）：
+
+1. `ApiException` → 原样映射（status/code/message）
+2. Bean Validation / 请求体解析 / 参数类型错误 → `400 INVALID_REQUEST`（details 含字段错误）
+3. `DataAccessException` → `503 DEPENDENCY_UNAVAILABLE`（记 ERROR 日志 + traceId）
+4. `Exception` 兜底 → `500 INTERNAL_ERROR`（记 ERROR 日志 + traceId）
+
+### 错误响应规范
+
+- 不泄露 SQL、堆栈、Token 或他人数据。
+- 非本人资源一律 `404`（不暴露存在性）：`/users/{userId}/loans` 的 `userId != JWT sub`、`/loans/{id}` 非本人、`/loan-operations/{key}` 无记录。
+- 业务拒绝记 **WARN** 日志（含 traceId、operation、resultCode），不记 ERROR。
+- 幂等重放返回原 `http_status` + 原响应体，并带 `Idempotent-Replay: true` 响应头。
+
+### 错误处理与可观测性关联
+
+| 场景 | 日志级别 | 指标 |
+|---|---|---|
+| 业务拒绝（409/403/404） | WARN | 借还拒绝计数（按错误码） |
+| 参数错误（400） | WARN | API 延迟分位数 |
+| 依赖不可用（503） | ERROR | 事务耗时、连接池使用率 |
+| 未预期（500） | ERROR | 死锁/锁等待次数 |
+
+---
+
+## 6.3 代码可维护性
+
+### 分层约定（Clean Architecture）
+
+每个业务模块内部严格四层，依赖只指向内层：
+
+```text
+api (Controller/DTO)
+  → application (用例/端口/服务)
+      → domain (纯领域，零框架依赖)
+infrastructure (Mapper/Row/Repository) 实现 application 端口
+```
+
+| 层 | 允许依赖 | 禁止 |
+|---|---|---|
+| api | application、common | 直接访问 infrastructure/domain 内部细节 |
+| application | domain、common、其他模块的端口接口 | 直接拼 SQL、访问对方 Repository |
+| domain | 仅 JDK | Spring、MyBatis、Servlet |
+| infrastructure | application 端口、MyBatis | 反向依赖 api |
+
+### 依赖规则（ArchUnit 可验证）
+
+1. **单向依赖**：`lending → account/catalog`（仅端口），禁止反向。
+2. **端口隔离**：跨模块只允许依赖 `application` 包中的接口（`*Port`），不依赖对方 `infrastructure`。
+3. **无循环**：模块间依赖图无环（common 在最底层）。
+4. **事务边界**：`@Transactional` 只出现在用例类（`BorrowLoan` / `ReturnLoan` / 清理任务），不散落在 Repository。
+5. **领域纯净**：`domain` 包不出现 `org.springframework` / `org.apache.ibatis` / `jakarta.*` import。
+
+> 已落地：`ArchitectureRulesTest`（ArchUnit）固化规则 1/2/3/5，见 `lending/src/test/java/com/elibrary/lending/architecture/`。
+
+### 命名约定
+
+| 类别 | 约定 | 示例 |
+|---|---|---|
+| 端口接口 | `{能力}Port` | `AccountAccessPort`、`CatalogReadPort`、`LoanCountPort` |
+| 用例服务 | 动词短语 | `BorrowLoan`、`ReturnLoan`、`GetMyAccount` |
+| 领域对象 | 领域名词 | `ReaderAccount`、`CatalogItem`、`Loan`、`LoanPolicy` |
+| 行映射 | `{表名}Row` | `AccountRow`、`ItemRow`、`LoanRow`、`IdempotencyRow` |
+| Mapper | `{表名}Mapper` | `AccountMapper`、`CatalogMapper`、`LoanMapper` |
+| 错误码 | `SCREAMING_SNAKE` | `BOOK_UNAVAILABLE`、`IDEMPOTENCY_KEY_REUSED` |
+| 包名 | `com.elibrary.{module}.{layer}` | `com.elibrary.lending.application` |
+
+### 测试金字塔
+
+```text
+        ▲  少量 E2E（主链路冒烟）
+       / \
+      /   \   集成（Testcontainers MySQL：并发/锁/幂等/回滚）
+     /     \
+    /       \  应用用例（幂等重放、错误映射、失败回滚）
+   /         \
+  /___________\  领域单元（DueDateCalculator、状态派生、规则边界）
+```
+
+| 层 | 重点 | 工具 |
+|---|---|---|
+| 领域单元 | 应还时间（跨月/闰日/夏令时）、`now == dueAt` 属逾期、状态转换 | JUnit 5 |
+| 应用用例 | 步骤顺序、幂等重放、错误映射、失败回滚 | JUnit 5 + Mock |
+| 集成 | 生成列唯一约束、行锁语义、最后名额 N 路并发、双归还只回补一次 | Testcontainers MySQL 8.4 |
+| API 契约 | 9 个接口状态码 + 错误码 + 关键字段 | MockMvc / TestRestTemplate |
+| E2E | 搜索 → 详情 → 借阅 → 重试 → 列表 → 逾期归还 → 历史 | 本地三服务 + Docker MySQL |
+
+### 代码评审清单
+
+- [ ] 跨模块调用是否只通过端口接口？
+- [ ] 事务是否只出现在用例层？异常是否整体回滚（未吞异常）？
+- [ ] 错误是否使用 `ApiException` + 稳定错误码？是否泄露内部细节？
+- [ ] 时间是否统一 UTC 存储 + 馆区时区展示？是否注入 `Clock`？
+- [ ] 幂等键是否校验 + 请求摘要比对？重放是否返回原结果？
+- [ ] 新 SQL 是否显式 `FOR UPDATE`（借还路径）？是否受唯一约束兜底？
+- [ ] 领域对象是否零框架依赖？命名是否符合约定？
+
+### 演进路径（可维护性视角）
+
+| 触发条件 | 演进动作 |
+|---|---|
+| 模块依赖规则被破坏 | 引入 ArchUnit 测试固化 |
+| 单服务吞吐不足 | 沿模块边界独立扩容（已具备独立 bootJar/镜像） |
+| 需要馆员维护目录 | 增加 catalog 管理 API（不破坏现有边界） |
+| 团队/模块独立发布 | 沿端口边界拆独立服务，引入 Outbox/事件 |
+| 历史借阅数据量大 | 按时间归档冷历史表；有效借阅始终留主表 |
 
 ---
 
@@ -447,6 +705,7 @@ elibrary-app/
 |---|---|
 | Domain 单元 | 应还时间（跨月/跨年/闰日/夏令时、23:59:00）、`now == dueAt` 属逾期、逾期派生、规则与状态转换的正向/拒绝/边界 |
 | Application 用例 | 步骤顺序、幂等重放、错误映射、失败回滚 |
+| 架构规则（ArchUnit） | 单向依赖、端口隔离、domain 纯净、api 不直接依赖 infrastructure |
 | 集成（真实 MySQL） | 生成列唯一约束、行锁语义、最后名额 N 路并发仅 1 成功、同读者并发借不同书不超 5 本、同读者同书并发只 1 条、双归还只回补一次、失败注入时 Loan 与库存同回滚 |
 | API 契约 | 9 个接口的状态码 + 错误码 + 关键字段，错误响应无敏感信息泄露 |
 | E2E 主链路 | 搜索 → 详情 → 借阅 → 超时用同 key 重试/查询 → 个人列表 → 到期（改 Clock）→ 逾期归还 → 历史；另覆盖"下架后仍可归还""最后名额竞争" |
@@ -460,7 +719,7 @@ elibrary-app/
 ## 9. 交付与部署
 
 - **构建**：Gradle Wrapper 构建 Spring Boot 可执行 JAR，并打包为 Docker 镜像。
-- **运行环境**：Docker；本地使用 Docker Compose 启动 app + MySQL，生产环境以 Docker 容器运行至少 2 个应用实例，并连接 MySQL 主备及 Nginx/LB。
+- **运行环境**：Docker；本地使用 Docker Compose 启动 MySQL + account + catalog + lending 三个服务，生产环境以 Docker 容器运行（每服务至少 2 个实例），并连接 MySQL 主备及 Nginx/LB。
 - **配置项**：JWT issuer/audience/JWK 地址、借阅策略（上限、天数、应还时刻、时区）、幂等保留天数、DB 连接、限流阈值。
 - **发布门禁**：单元 + 集成（含并发）测试通过、Flyway 迁移可重复执行、健康检查就绪、冒烟用例通过。
 - **初始数据**：通过 Flyway 种子脚本或运维导入工具写入分类、目录条目（含 `total_copies/available_copies`）和读者账号。本期不提供馆员维护界面。
@@ -478,7 +737,7 @@ MVP 的模块边界与表设计已为下列演进预留空间；**只有出现�
 | 单应用/单库吞吐不足 | 应用水平扩容 → 读副本承接目录读 → 垂直扩容；借还仍走主库 |
 | 需要馆员维护目录/名额 | 增加 catalog 管理 API；需要逐名额管理时再引入 `loan_slots` 表 |
 | 需要阅读/下载正文 | 引入对象存储 + `book_assets` + 短时签名 URL + CDN，新增 `content-access` 接口，授权依赖有效 Loan |
-| 团队/模块独立发布需求 | 沿 account / catalog / lending 模块边界拆服务，再按需引入 Outbox、消息队列与资格投影 |
+| 团队/模块独立发布需求 | 已具备独立 bootJar/镜像；进一步引入 Outbox、消息队列与资格投影，实现物理隔离部署 |
 | 多馆/多租户 | 增加 `library_id`，按馆分库；保证账号、目录库存、借阅同馆同库 |
 | 历史借阅数据量大 | 按时间归档冷历史表；有效借阅始终留主表 |
 | 通知、预约、罚金、续借 | 作为新模块/事件消费者接入，不改动借还核心事务 |
