@@ -40,7 +40,6 @@ Lending ── LoanBorrowed/LoanReturned ──> Event Broker / Outbox
 - **Kafka（或兼容持久化消息的 RabbitMQ）**：用于跨服务状态传播、重放和削峰；本设计选 Kafka 作为事件日志默认方案，利用分区键和 offset 管理有序消费。低吞吐部署可使用 RabbitMQ，但须保留 Outbox、去重、重试和死信语义。
 - **OpenSearch**：用于大小写/全半角规范化后的字段包含搜索和分页排序，避免在高读目录检索场景下把复杂搜索负载压到交易数据库；其索引是可重建投影，不是目录事实源。
 - **S3 兼容对象存储 + CDN**：电子书正文常为大文件且读取/断点续传模式不同于事务数据，对象存储提供高耐久、低成本、版本与 Range 读取；CDN 将热点内容从业务服务卸载。私有源站和短时签名授权控制读权限。
-- **Data Lake（大数据阶段）**：Parquet/Iceberg 将事件/CDC 与在线事务隔离，适合大规模历史分析、批处理和重算；不引入对业务 MySQL 的全表分析负载。
 - **Redis**：只用于 Gateway 限流、短期缓存或分布式读缓存；不能保存权威库存/借阅状态或唯一幂等记录，以免缓存失效造成超借。
 - **OpenTelemetry + Prometheus/Grafana**：以统一 Trace、Metrics、Logs 关联跨服务 API 与异步消息，降低分布式故障定位成本。
 - **数据库策略**：每服务独立 MySQL database、账号与迁移；Catalog 配 OpenSearch。Flyway 管理迁移，时间字段统一存 UTC `DATETIME(6)`，应用层使用 `Instant`；连接会话时区设为 `+00:00`。
@@ -55,13 +54,12 @@ Lending ── LoanBorrowed/LoanReturned ──> Event Broker / Outbox
 
 | 存储 | 所属服务 | 保存内容 | 一致性与用途 |
 |---|---|---|---|
-| MySQL/InnoDB `account_db` | Account | `accounts`、账号状态、资格等级、版本、审计事件 | 账号状态唯一事实源；状态变更写 Outbox。 |
+| MySQL/InnoDB `account_db` | Account | `accounts`、`account_audit_log`、账号状态、资格等级、版本 | 账号状态唯一事实源；状态变更、审计和 Outbox 同事务写入。 |
 | MySQL/InnoDB `catalog_db` | Catalog | `catalog_items`、`categories`、类型化元数据、发布状态、数字资源资产元数据、Outbox | 目录与资源资产元数据主数据；读写一致性由 Catalog 本地事务保证。 |
 | OpenSearch `catalog_read` | Catalog | 上架条目搜索文档、分类聚合及可借数投影 | 可丢弃重建的检索投影；目录由 Catalog Outbox 更新，可借数由 Lending 事件更新，最终一致。 |
 | MySQL/InnoDB `lending_db` | Lending | `catalog_item_projection`、`reader_eligibility_projection`、`loan_slots`、`loans`、`reader_loan_guard`、`idempotency_records`、`inbox`、`outbox` | Loan/Slot/幂等结果同库事务强一致；外部投影带源版本和更新时间。 |
 | S3 兼容对象存储 | Content Storage | 电子书/期刊原始文件、转码文件、封面和校验清单 | 对象以不可变版本/内容哈希寻址；启用服务端加密、版本控制、生命周期与跨区备份。 |
 | CDN（私有源站） | Content Delivery（未来启用） | 缓存加密/受控的静态阅读资源 | 只缓存可公开封面或短时授权内容；私有内容必须先鉴权并签发短时 URL，源站桶禁止公网读。 |
-| S3 Data Lake（建议大数据阶段启用） | Data Platform | CDC/领域事件、聚合指标、脱敏分析明细，按 Parquet/Iceberg 分层保存 | 分析与离线计算不查询业务 MySQL；保留/删除策略按数据分类管理。 |
 | Kafka `elibrary.*` topics | 平台 | 账号、目录、借还领域事件 | 至少一次投递；按 `accountId` 或 `catalogItemId` 分区，消费者去重并拒绝旧版本。 |
 | Redis（可选） | Gateway/读服务 | 限流桶、可丢弃热点缓存 | 缓存可随时失效；不作事实源。 |
 
@@ -82,15 +80,237 @@ Lending DB: catalog_item_projection(item_id PK, shelf_status, title, creator, ty
             loans(loan_id PK, account_id, item_id, slot_id, status, borrowed_at, due_at,
                   returned_at, active_account_id, active_slot_id, title_snapshot,
                   creator_snapshot, type_snapshot, policy_version, version)
-            idempotency_records(account_id, operation, key, request_hash, state,
+            idempotency_records(account_id, operation, idempotency_key, request_hash, state,
                                 http_status, response_json, created_at, expires_at)
 ```
 
 MySQL 实现约束：InnoDB 表使用 `DATETIME(6)` UTC、`BIGINT` 自增或应用生成的 UUID/ULID 主键；Loan 用生成列 `active_account_id = IF(returned_at IS NULL, account_id, NULL)` 和 `active_slot_id = IF(returned_at IS NULL, slot_id, NULL)`，分别建 `UNIQUE(active_account_id,item_id)`、`UNIQUE(active_slot_id)`，借此实现仅对有效借阅生效的唯一约束（MySQL 无部分索引；唯一索引允许多个 `NULL`）。有效项索引为 `(account_id, returned_at, due_at)`；可用名额索引 `(item_id,status,slot_id)`；幂等表主键 `(account_id,operation,key)` 并比较 `request_hash`。用 `CHECK` 约束保证字段范围，用事务同步维护 Slot 状态和 Loan 终态。`SELECT ... FOR UPDATE` 锁定 guard、目录投影和 Slot；名额查询使用有序锁，不用可能跳过唯一竞争者并误报无库存的 `SKIP LOCKED`。MySQL 分区表要求分区表达式的列纳入所有唯一键，与现有有效 Loan 唯一约束存在冲突；因此初期不按时间分区 Loans，先按业务库/馆区分库、归档冷历史表，并保留约束完整性。[生成列索引说明](https://dev.mysql.com/doc/refman/8.4/en/alter-table-generated-columns.html)、[唯一索引与 NULL 语义](https://dev.mysql.com/doc/refman/8.4/en/create-table.html)、[分区键与唯一键限制](https://dev.mysql.com/doc/refman/8.4/en/partitioning-limitations-partitioning-keys-unique-keys.html)。
 
-核心借阅表 DDL 轮廓（字符集统一 `utf8mb4`，所有业务时间列按 UTC 写入）：
+Loan 的逐字段定义见下方全量 DDL；应用层还需保证 Slot 与 Loan 在同一事务中同步改状态。迁移前须在目标 MySQL 8.4 minor 版本验证生成列、CHECK 与 JDBC 映射。
+
+### 全量业务表 DDL（MySQL 8.4 / InnoDB）
+
+以下为本期所有业务持久化表的基线 DDL；每段由对应服务单独执行在自己的 database，禁止跨服务外键。事件 Outbox/Inbox 分别存在于各服务库。主键采用 UUIDv7 的 16 字节形式；API 示例中的 `bk_01` 等为便于阅读的符号 ID，实际可使用 UUID 字符串。
+
+借阅策略上限、自然日数、归还本地时刻和馆区时区来自版本化应用配置；PRD 未定义馆员策略编辑 API，因此不另建可编辑策略表。每笔 Loan 保存 `policy_version` 及计算后的 `due_at`，配置变更不影响既有借阅。
+
+部署初始化（数据库账号/密码由 Secret 管理系统注入；每个 Service 只授予自身库的权限）：
 
 ```sql
+CREATE DATABASE account_db CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+CREATE DATABASE catalog_db CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+CREATE DATABASE lending_db CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+```
+
+#### Account Service：`account_db`
+
+```sql
+CREATE TABLE accounts (
+  account_id BINARY(16) NOT NULL,
+  status VARCHAR(32) NOT NULL,
+  eligibility_level VARCHAR(32) NOT NULL DEFAULT 'STANDARD',
+  display_name VARCHAR(160) NULL,
+  version BIGINT UNSIGNED NOT NULL DEFAULT 1,
+  created_at DATETIME(6) NOT NULL,
+  updated_at DATETIME(6) NOT NULL,
+  PRIMARY KEY (account_id),
+  KEY ix_accounts_status_updated (status, updated_at),
+  CONSTRAINT ck_account_status CHECK
+    (status IN ('NORMAL','FROZEN','PENDING_VERIFICATION','DELETED'))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE account_outbox (
+  event_id BINARY(16) NOT NULL,
+  aggregate_id BINARY(16) NOT NULL,
+  aggregate_version BIGINT UNSIGNED NOT NULL,
+  event_type VARCHAR(128) NOT NULL,
+  payload JSON NOT NULL,
+  created_at DATETIME(6) NOT NULL,
+  published_at DATETIME(6) NULL,
+  attempts INT UNSIGNED NOT NULL DEFAULT 0,
+  PRIMARY KEY (event_id),
+  KEY ix_account_outbox_pending (published_at, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE account_audit_log (
+  audit_id BINARY(16) NOT NULL,
+  account_id BINARY(16) NOT NULL,
+  actor_id BINARY(16) NULL,
+  action VARCHAR(64) NOT NULL,
+  old_status VARCHAR(32) NULL,
+  new_status VARCHAR(32) NULL,
+  reason_code VARCHAR(64) NULL,
+  trace_id VARCHAR(64) NULL,
+  created_at DATETIME(6) NOT NULL,
+  PRIMARY KEY (audit_id),
+  KEY ix_account_audit_history (account_id, created_at, audit_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+凭证/密码不存于 `accounts`；OIDC 身份提供方管理登录凭证。账号创建、冻结、注销由受信任账号管理流程调用 Account 应用服务后，在同一事务写 `accounts` 与 `account_outbox`。
+
+#### Catalog Service：`catalog_db`
+
+```sql
+CREATE TABLE categories (
+  category_id BINARY(16) NOT NULL,
+  name VARCHAR(120) NOT NULL,
+  status VARCHAR(16) NOT NULL DEFAULT 'ACTIVE',
+  sort_order INT NOT NULL DEFAULT 0,
+  version BIGINT UNSIGNED NOT NULL DEFAULT 1,
+  created_at DATETIME(6) NOT NULL,
+  updated_at DATETIME(6) NOT NULL,
+  PRIMARY KEY (category_id),
+  UNIQUE KEY uk_category_name (name),
+  KEY ix_category_status_sort (status, sort_order, name),
+  CONSTRAINT ck_category_status CHECK (status IN ('ACTIVE','DISABLED'))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE catalog_items (
+  item_id BINARY(16) NOT NULL,
+  type VARCHAR(24) NOT NULL,
+  title VARCHAR(512) NOT NULL,
+  creator VARCHAR(512) NULL,
+  category_id BINARY(16) NOT NULL,
+  subject_keywords JSON NULL,
+  description TEXT NULL,
+  publisher VARCHAR(255) NULL,
+  publication_date DATE NULL,
+  language_code VARCHAR(16) NULL,
+  identifier_type VARCHAR(24) NULL,
+  identifier_value VARCHAR(128) NULL,
+  metadata JSON NULL,
+  shelf_status VARCHAR(32) NOT NULL,
+  published_at DATETIME(6) NULL,
+  version BIGINT UNSIGNED NOT NULL DEFAULT 1,
+  created_at DATETIME(6) NOT NULL,
+  updated_at DATETIME(6) NOT NULL,
+  PRIMARY KEY (item_id),
+  KEY ix_catalog_category_status (category_id, shelf_status, item_id),
+  KEY ix_catalog_status_published (shelf_status, published_at, title, item_id),
+  KEY ix_catalog_identifier (identifier_type, identifier_value),
+  CONSTRAINT fk_catalog_category FOREIGN KEY (category_id)
+    REFERENCES categories(category_id),
+  CONSTRAINT ck_catalog_type CHECK (type IN ('EBOOK','PERIODICAL')),
+  CONSTRAINT ck_catalog_shelf CHECK
+    (shelf_status IN ('ON_SHELF','UNLISTING_PENDING','OFF_SHELF','REMOVED'))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE book_assets (
+  asset_id BINARY(16) NOT NULL,
+  item_id BINARY(16) NOT NULL,
+  asset_kind VARCHAR(24) NOT NULL,
+  asset_version INT UNSIGNED NOT NULL,
+  object_key VARCHAR(1024) NOT NULL,
+  object_version VARCHAR(255) NOT NULL,
+  media_type VARCHAR(128) NOT NULL,
+  size_bytes BIGINT UNSIGNED NOT NULL,
+  sha256 BINARY(32) NOT NULL,
+  encryption_key_ref VARCHAR(255) NOT NULL,
+  asset_status VARCHAR(24) NOT NULL,
+  created_at DATETIME(6) NOT NULL,
+  PRIMARY KEY (asset_id),
+  UNIQUE KEY uk_asset_version (item_id, asset_kind, asset_version),
+  UNIQUE KEY uk_asset_object_version (object_key(512), object_version(128)),
+  KEY ix_asset_item_status (item_id, asset_status, asset_kind),
+  CONSTRAINT fk_asset_catalog_item FOREIGN KEY (item_id)
+    REFERENCES catalog_items(item_id),
+  CONSTRAINT ck_asset_kind CHECK
+    (asset_kind IN ('ORIGINAL','READING_RENDITION','COVER','MANIFEST')),
+  CONSTRAINT ck_asset_status CHECK
+    (asset_status IN ('QUARANTINED','SCANNING','READY','REJECTED','RETIRED'))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE borrow_leases (
+  lease_id BINARY(16) NOT NULL,
+  item_id BINARY(16) NOT NULL,
+  caller_service VARCHAR(64) NOT NULL,
+  idempotency_key VARCHAR(128) NOT NULL,
+  catalog_version BIGINT UNSIGNED NOT NULL,
+  state VARCHAR(16) NOT NULL,
+  created_at DATETIME(6) NOT NULL,
+  expires_at DATETIME(6) NOT NULL,
+  released_at DATETIME(6) NULL,
+  PRIMARY KEY (lease_id),
+  UNIQUE KEY uk_borrow_lease_key (item_id, caller_service, idempotency_key),
+  KEY ix_borrow_lease_item_active (item_id, state, expires_at),
+  CONSTRAINT fk_borrow_lease_item FOREIGN KEY (item_id)
+    REFERENCES catalog_items(item_id),
+  CONSTRAINT ck_borrow_lease_state CHECK
+    (state IN ('ACTIVE','RELEASED','EXPIRED')),
+  CONSTRAINT ck_borrow_lease_time CHECK (expires_at > created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE catalog_outbox (
+  event_id BINARY(16) NOT NULL,
+  aggregate_id BINARY(16) NOT NULL,
+  aggregate_version BIGINT UNSIGNED NOT NULL,
+  event_type VARCHAR(128) NOT NULL,
+  payload JSON NOT NULL,
+  created_at DATETIME(6) NOT NULL,
+  published_at DATETIME(6) NULL,
+  attempts INT UNSIGNED NOT NULL DEFAULT 0,
+  PRIMARY KEY (event_id),
+  KEY ix_catalog_outbox_pending (published_at, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE catalog_inbox (
+  consumer_name VARCHAR(128) NOT NULL,
+  event_id BINARY(16) NOT NULL,
+  aggregate_id BINARY(16) NOT NULL,
+  aggregate_version BIGINT UNSIGNED NOT NULL,
+  received_at DATETIME(6) NOT NULL,
+  processed_at DATETIME(6) NULL,
+  PRIMARY KEY (consumer_name, event_id),
+  KEY ix_catalog_inbox_pending (consumer_name, processed_at, received_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+#### Lending Service：`lending_db`
+
+```sql
+CREATE TABLE catalog_item_projection (
+  item_id BINARY(16) NOT NULL,
+  shelf_status VARCHAR(32) NOT NULL,
+  title VARCHAR(512) NOT NULL,
+  creator VARCHAR(512) NULL,
+  type VARCHAR(24) NOT NULL,
+  category_id BINARY(16) NOT NULL,
+  catalog_version BIGINT UNSIGNED NOT NULL,
+  observed_at DATETIME(6) NOT NULL,
+  PRIMARY KEY (item_id),
+  KEY ix_catalog_projection_status (shelf_status, item_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE reader_eligibility_projection (
+  account_id BINARY(16) NOT NULL,
+  status VARCHAR(32) NOT NULL,
+  account_version BIGINT UNSIGNED NOT NULL,
+  observed_at DATETIME(6) NOT NULL,
+  PRIMARY KEY (account_id),
+  KEY ix_reader_eligibility_status (status, observed_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE reader_loan_guard (
+  account_id BINARY(16) NOT NULL,
+  version BIGINT UNSIGNED NOT NULL DEFAULT 1,
+  updated_at DATETIME(6) NOT NULL,
+  PRIMARY KEY (account_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE loan_slots (
+  slot_id BINARY(16) NOT NULL,
+  item_id BINARY(16) NOT NULL,
+  status VARCHAR(16) NOT NULL,
+  version BIGINT UNSIGNED NOT NULL DEFAULT 1,
+  updated_at DATETIME(6) NOT NULL,
+  PRIMARY KEY (slot_id),
+  KEY ix_slot_item_status (item_id, status, slot_id),
+  CONSTRAINT fk_slot_item_projection FOREIGN KEY (item_id)
+    REFERENCES catalog_item_projection(item_id),
+  CONSTRAINT ck_slot_status CHECK (status IN ('AVAILABLE','LOANED','DISABLED'))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 CREATE TABLE loans (
   loan_id BINARY(16) NOT NULL,
   account_id BINARY(16) NOT NULL,
@@ -108,19 +328,61 @@ CREATE TABLE loans (
   creator_snapshot VARCHAR(512) NULL,
   type_snapshot VARCHAR(32) NOT NULL,
   policy_version VARCHAR(64) NOT NULL,
-  version BIGINT NOT NULL DEFAULT 1,
+  version BIGINT UNSIGNED NOT NULL DEFAULT 1,
   PRIMARY KEY (loan_id),
   UNIQUE KEY uk_active_account_item (active_account_id, item_id),
   UNIQUE KEY uk_active_slot (active_slot_id),
   KEY ix_account_due (account_id, returned_at, due_at, loan_id),
+  KEY ix_item_history (item_id, borrowed_at, loan_id),
+  CONSTRAINT fk_loan_slot FOREIGN KEY (slot_id) REFERENCES loan_slots(slot_id),
   CONSTRAINT ck_loan_time CHECK (due_at > borrowed_at),
   CONSTRAINT ck_loan_state CHECK
     ((returned_at IS NULL AND status = 'ACTIVE') OR
      (returned_at IS NOT NULL AND status IN ('RETURNED','RETURNED_LATE')))
-) ENGINE=InnoDB;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE idempotency_records (
+  account_id BINARY(16) NOT NULL,
+  operation VARCHAR(64) NOT NULL,
+  idempotency_key VARCHAR(128) NOT NULL,
+  request_hash BINARY(32) NOT NULL,
+  state VARCHAR(16) NOT NULL,
+  http_status SMALLINT UNSIGNED NULL,
+  response_json JSON NULL,
+  created_at DATETIME(6) NOT NULL,
+  expires_at DATETIME(6) NOT NULL,
+  PRIMARY KEY (account_id, operation, idempotency_key),
+  KEY ix_idempotency_expiry (expires_at),
+  CONSTRAINT ck_idempotency_state CHECK
+    (state IN ('PROCESSING','COMPLETED','REJECTED'))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE lending_inbox (
+  consumer_name VARCHAR(128) NOT NULL,
+  event_id BINARY(16) NOT NULL,
+  aggregate_id BINARY(16) NOT NULL,
+  aggregate_version BIGINT UNSIGNED NOT NULL,
+  received_at DATETIME(6) NOT NULL,
+  processed_at DATETIME(6) NULL,
+  PRIMARY KEY (consumer_name, event_id),
+  KEY ix_lending_inbox_pending (consumer_name, processed_at, received_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE lending_outbox (
+  event_id BINARY(16) NOT NULL,
+  aggregate_id BINARY(16) NOT NULL,
+  aggregate_version BIGINT UNSIGNED NOT NULL,
+  event_type VARCHAR(128) NOT NULL,
+  payload JSON NOT NULL,
+  created_at DATETIME(6) NOT NULL,
+  published_at DATETIME(6) NULL,
+  attempts INT UNSIGNED NOT NULL DEFAULT 0,
+  PRIMARY KEY (event_id),
+  KEY ix_lending_outbox_pending (published_at, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ```
 
-应用层还需保证 Slot 与 Loan 在同一事务中同步改状态；两组唯一键分别防止同一读者同条目重复有效借阅、同一名额被多条有效记录占用。迁移前必须在目标 MySQL 8.4 minor 版本验证 generated column、CHECK 与 JDBC 映射。
+另外，OpenSearch 的索引 mapping 由版本化模板管理，不属于 MySQL DDL；Kafka topics、ACL、分区数和 retention 用平台 IaC 定义；对象桶/加密策略/CDN 私有源站也由 IaC 创建。Redis 为可选缓存且不存事实数据，本期不要求 Redis 持久表 DDL。
 
 目录元数据使用关系列保存核心检索/过滤字段，类型特有属性放版本化 MySQL JSON 列或类型子表；OpenSearch 文档经 Unicode NFKC、大小写折叠后建立标题/作者/主题字段。Loan 的展示快照与目录原始数据分开保存，永久删除 Catalog 数据后仍可还书和读历史。业务时间以 UTC Instant 写入 MySQL `DATETIME(6)`，API 转为配置馆区时区；保留事件 ID、聚合版本、Trace ID 以支持审计、去重和重放。
 
@@ -136,12 +398,12 @@ CREATE TABLE loans (
 
 ### 大数据规模与扩展策略
 
-- **热数据与冷数据分层**：Catalog MySQL 保存规范化元数据；OpenSearch 承担高并发全文/包含检索；对象存储承载 TB/PB 级正文、封面和派生件；Kafka 承载增量事件；Data Lake 保存 CDC/事件生成的 Parquet/Iceberg 数据用于离线统计、推荐/趋势分析。禁止在业务 MySQL 上跑全馆统计或大范围扫描。
+- **热数据与冷数据分层**：Catalog MySQL 保存规范化元数据；OpenSearch 承担高并发全文/包含检索；对象存储承载 TB/PB 级正文、封面和派生件；Kafka 承载增量事件。离线报表暂由受限只读副本和定时导出承载；数据量或分析负载达到评估阈值后再单独立项评审分析平台，不在业务 MySQL 主库运行全馆统计或大范围扫描。
 - **读扩展**：Catalog 搜索走 OpenSearch；公开详情/分类只读可走 MySQL 只读副本并标注投影新鲜度。借阅额度、逾期、账号资格、库存锁和幂等都必须读写主库；借还后个人列表需读主库或基于 GTID 等待副本追平，保证 read-your-writes。缓存仅用于可容忍过期的目录元数据/公开封面，并通过事件失效。
 - **写扩展与分片边界**：当前单馆单 Lending MySQL InnoDB Cluster 采用单主写，应用水平扩容，热点名额在行锁上串行化；先通过垂直扩容、连接池治理、读副本和历史归档扩展。多馆/多租户时按 `library_id` 做数据库分片，账号、目录名额和借阅在同一馆区落同一 Lending shard，确保额度与最后名额事务不跨分片。单馆数据超过单分片写能力时，必须先评审将用户额度/逾期限制改为分布式额度令牌或接受 Saga 中间态；不可仅按 userId 或 itemId 拆开 Loan 与 Slot，破坏原子不变量。
 - **分区与归档**：Catalog 可按 `library_id` 或高频检索域分片；`loans` 按时间归档到只读历史库，但当前有效记录始终留在事务主库。MySQL 原生分区需把分区键纳入所有唯一键，因此只有在生成列唯一约束和分区键兼容性经验证后才启用。归档前必须确保用户历史查询可跨冷热层稳定排序/分页，借还查询只访问热表。
-- **事件/搜索重建**：Outbox CDC 推送 Kafka；消费者幂等更新 OpenSearch 和分析仓库。需定义全量快照 + binlog offset 的重建流程、回放限速、消费 lag 告警及 DLQ 修复流程。索引重建期间双索引切换，避免阻塞目录检索。
-- **容量指标**：上线前用真实书目数量、元数据大小、日借还量、峰值搜索 QPS、文件总量/增长率、Range 吞吐和恢复时间目标进行压测并确定分片/副本数；不预设虚假容量阈值。监控 MySQL QPS/锁等待/复制延迟、Kafka lag、OpenSearch shard/merge、对象存储请求与 CDN 命中率、数据湖摄取延迟。
+- **事件/搜索重建**：Outbox Relay 推送 Kafka；消费者幂等更新 OpenSearch。需定义全量快照 + binlog offset 的重建流程、回放限速、消费 lag 告警及 DLQ 修复流程。索引重建期间双索引切换，避免阻塞目录检索。
+- **容量指标**：上线前用真实书目数量、元数据大小、日借还量、峰值搜索 QPS、文件总量/增长率、Range 吞吐和恢复时间目标进行压测并确定分片/副本数；不预设虚假容量阈值。监控 MySQL QPS/锁等待/复制延迟、Kafka lag、OpenSearch shard/merge、对象存储请求与 CDN 命中率、离线导出耗时。
 
 ### 业务场景系统交互与数据流转图
 
@@ -516,8 +778,8 @@ API 分成读者公开 API、服务间内部 API 与事件契约。登录/凭证
 
 ### 服务间目录/库存 API（仅内网 mTLS）
 
-- `POST /internal/v1/catalog/availability:batchGet`（Lending 提供）：Catalog 请求示例 `{"itemIds":["bk_01","bk_02"]}`；Lending 响应 `{"items":[{"itemId":"bk_01","availableCount":2,"version":31,"observedAt":"2026-10-29T10:00:00Z"}]}`。超过 100 个 ID 返回 `400`。用于详情/读模型补充，不作借阅授权。
-- `POST /internal/v1/catalog-items/{itemId}/borrow-leases`（Catalog 提供）：Lending 用 mTLS 申请短租约，不含请求体；仅 `ON_SHELF` 签发。响应 `{"leaseId":"lease_01","itemId":"bk_01","catalogVersion":42,"expiresAt":"2026-10-29T10:00:15Z"}`。下架/移除返回 `409 BOOK_UNAVAILABLE`，未知项 `404`，服务超时 `503`。Lease TTL 建议 15 秒；Lending 事务必须有短于 TTL 的硬超时和失效前提交门槛，超时必须回滚，Catalog 延迟释放待下架状态至少一个事务超时宽限期。
+- `POST /internal/v1/catalog/availability:batchGet`（Lending 提供）：Catalog 请求示例 `{"itemIds":["bk_01","bk_02"]}`；Lending 响应 `{"items":[{"itemId":"bk_01","availability":"AVAILABLE","availableCount":2,"version":31,"observedAt":"2026-10-29T10:00:00Z"},{"itemId":"bk_02","availability":"NOT_FOUND","availableCount":0,"version":0,"observedAt":"2026-10-29T10:00:00Z"}]}`。每个请求 ID 原序返回一项；不存在项标记 `NOT_FOUND`，正常零库存标记 `UNAVAILABLE`。超过 100 个 ID 返回 `400`。用于详情/读模型补充，不作借阅授权。
+- `POST /internal/v1/catalog-items/{itemId}/borrow-leases`（Catalog 提供）：Lending 用 mTLS 申请短租约，要求 `Idempotency-Key`（复用 Lending operation key），无请求体；仅 `ON_SHELF` 签发。响应 `{"leaseId":"lease_01","itemId":"bk_01","catalogVersion":42,"expiresAt":"2026-10-29T10:00:15Z"}`。同键重试返回同一 lease；下架/移除返回 `409 BOOK_UNAVAILABLE`，未知项 `404`，服务超时 `503`。Lease TTL 建议 15 秒；Lending 事务必须有短于 TTL 的硬超时和失效前提交门槛，超时必须回滚，Catalog 延迟释放待下架状态至少一个事务超时宽限期。
 - `DELETE /internal/v1/catalog-items/{itemId}/borrow-leases/{leaseId}`（Catalog 提供）：Lending 在提交/回滚后释放，重复释放幂等 `204`；未知/过期 lease 返回 `204`。进程崩溃由 TTL 清理。
 - `GET /internal/v1/catalog-items/{itemId}/lending-eligibility`（Catalog 提供，可选只读）：只用于诊断/详情，不作为并发借阅授权；`200` 返回 `shelfStatus` 和 `catalogVersion`，不存在 `404`。
 - 两接口均需 mTLS、服务身份 allowlist、短超时、熔断和限流；不接受客户端传入的 `accountId` 作为授权主体。
@@ -550,7 +812,7 @@ HTTP/1.1 200 OK
 }
 ```
 
-状态码：`200`；`400 INVALID_QUERY`（关键词过长、未知筛选/排序或分页格式错误）；`401 UNAUTHENTICATED`（若部署策略要求浏览必须登录，否则公开浏览不返回该状态）；`500 INTERNAL_ERROR`。
+状态码：`200`；`400 INVALID_QUERY`（关键词过长、未知筛选/排序或分页格式错误）；`500/503` 搜索依赖不可用。该目录 API 对匿名读者开放。
 
 ### 1a. 获取可用分类
 
@@ -560,7 +822,7 @@ HTTP/1.1 200 OK
 {"code":"OK","message":"success","timestamp":"2026-10-29T10:00:00+08:00","traceId":"tr-123a","data":{"items":[{"id":"cat_1","name":"文学","itemCount":18}],"page":1,"pageSize":100,"total":1,"sort":"name_asc,id_asc"}}
 ```
 
-状态码：`200`；`400 INVALID_QUERY`；`500 INTERNAL_ERROR`。
+状态码：`200`；`400 INVALID_QUERY`；`500/503` 分类查询依赖不可用。该目录 API 对匿名读者开放。
 
 ### 2. 获取图书详情
 
@@ -601,7 +863,7 @@ Request：
 
 ### 5. 查询个人借阅记录
 
-`GET /api/v1/users/{userId}/loans?status=ACTIVE&page=1&pageSize=20&sort=dueAt_asc`。`userId` 必须与认证主体一致，否则返回 `404`，避免泄露用户存在性。支持 `ACTIVE`、`OVERDUE`、`COMPLETED`，未传状态时返回全部并按分组字段展示；也可使用别名 `/api/v1/users/me/loans`，由 Gateway 将 `me` 绑定为认证主体。
+`GET /api/v1/users/{userId}/loans?status=ACTIVE&page=1&pageSize=20&sort=dueAt_asc`。`userId` 必须与认证主体一致，否则返回 `404`，避免泄露用户存在性。支持 `ACTIVE`、`OVERDUE`、`COMPLETED`，未传状态时返回全部并按分组字段展示。
 
 ```json
 {"code":"OK","message":"success","timestamp":"2026-10-29T10:00:00+08:00","traceId":"tr-127","data":{"items":[{"id":"loan_01","catalogItemId":"bk_01","title":"示例书","creator":"作者甲","type":"EBOOK","catalogStatus":"ON_SHELF","borrowedAt":"2026-10-29T10:00:00+08:00","dueAt":"2026-11-11T23:59:00+08:00","returnedAt":null,"status":"ACTIVE","timeRemaining":{"kind":"DAYS_REMAINING","days":13},"actions":["RETURN"]}],"page":1,"pageSize":20,"total":1,"sort":"dueAt_asc,id_asc"}}
@@ -649,6 +911,204 @@ Request：
 | Catalog（内部） | `DELETE /internal/v1/catalog-items/{itemId}/borrow-leases/{leaseId}` | mTLS 服务身份 | Lending 完成借阅后释放 lease |
 
 本期不提供用户注册/登录、密码/MFA、馆藏增删改/上下架/名额管理、续借、预约、罚金、通知、阅读内容访问 API。账号创建及状态变更由受信任的账号管理渠道处理；账号查询与借阅资格由 Account Service 提供。健康检查和指标端点仅集群内部使用，不属于读者业务 API：`/actuator/health/liveness`、`/actuator/health/readiness`、`/actuator/prometheus`，经网络策略限制访问。
+
+### 每个接口的测试用例（输入/输出契约）
+
+#### 测试固定条件与通用断言
+
+- 集成测试固定 Clock：`2026-10-29T10:00:00+08:00`，馆区时区 `Asia/Shanghai`。成功借阅默认 `borrowedAt=2026-10-29T10:00:00+08:00`、`dueAt=2026-11-11T23:59:00+08:00`。
+- `U1` 为正常读者、当前 0 项有效借阅、无逾期；`U2` 为冻结读者；`U3` 有 1 项逾期；`U4` 已有 5 项有效借阅。`B1` 上架且有 1 个名额；`B0` 上架但无名额；`BO` 下架；`BR` 永久移除。所有 IDs 在自动化测试中用固定 UUIDv7。
+- 认证用户测试使用 `Authorization: Bearer <valid-token>`；借还测试另带唯一 `Idempotency-Key`。错误统一断言 `{code,message,details,timestamp,traceId}`，并验证无数据泄漏。
+- 下列表格中的输出为必须断言的 HTTP 状态码、`code` 或关键 JSON 字段；随机生成的 loanId/traceId 用 schema 和非空断言，不比较固定值。
+
+#### A. `GET /api/v1/accounts/me`
+
+| 场景 | 输入 | 预期输出 |
+|---|---|---|
+| 正常账号 | 有效 JWT subject=U1 | `200`，`data={accountId:U1,status:NORMAL,borrowingEligible:true,activeLoanLimit:5}` |
+| 冻结/待核验/注销 | subject 分别对应三种账号状态 | `200`，状态准确，`borrowingEligible=false`，有可展示限制原因；不得返回凭证字段 |
+| 无 Token/Token 过期或签名错误 | 缺失/无效 Bearer | `401 UNAUTHENTICATED` |
+| Token 无业务账号 | subject 无 Account 记录 | `404 ACCOUNT_NOT_FOUND` |
+| Account DB 不可用 | 有效 Token，注入连接失败 | `503 DEPENDENCY_UNAVAILABLE`，不返回内部异常 |
+
+#### B. `GET /internal/v1/accounts/{accountId}/borrowing-eligibility`
+
+| 场景 | 输入 | 预期输出 |
+|---|---|---|
+| 正常 | mTLS Lending 身份，U1 | `200 {accountId:U1,status:NORMAL,eligible:true,accountVersion:n,evaluatedAt:...}` |
+| 不可借账号 | U2/U3 等状态账号 | `200 eligible=false` 且状态对应，不把资格拒绝误报成系统故障 |
+| 不存在 | 未登记 accountId | `404 ACCOUNT_NOT_FOUND` |
+| 非可信调用方 | 无 mTLS/错误 workload identity | `401/403 SERVICE_UNAUTHENTICATED`，不查询账号 |
+| DB 超时/熔断 | 注入 Account DB/服务故障 | `503 DEPENDENCY_UNAVAILABLE`，Lending 不可 fail-open |
+
+#### C. `POST /internal/v1/catalog/availability:batchGet`
+
+| 场景 | 输入 | 预期输出 |
+|---|---|---|
+| 多条目查询 | mTLS Catalog；`{"itemIds":[B1,B0]}` | `200`，items 对每个 ID 返回 `availableCount`、projection `version`、`observedAt`；B1=1、B0=0 |
+| 空数组 | `{"itemIds":[]}` | `200 {items:[]}`，不访问 Lending DB |
+| 未知/已移除 ID | 含 BR | `200`；对应 `availableCount:0,availability:NOT_FOUND`，不泄露 Loan 信息 |
+| 超过 100 个 ID/格式错误 | 101 项或非法 ID | `400 INVALID_REQUEST`，无部分响应 |
+| 无 mTLS/越权服务身份 | 错误 workload identity | `401/403 SERVICE_UNAUTHENTICATED` |
+| Lending DB 故障 | 注入超时 | `503 DEPENDENCY_UNAVAILABLE`，Catalog 不将缓存伪装成实时数据；可返回有时效标记的既有投影仅在契约允许时 |
+
+#### D. `GET /internal/v1/catalog-items/{itemId}/lending-eligibility`
+
+| 场景 | 输入 | 预期输出 |
+|---|---|---|
+| 上架 | mTLS Lending，B1 | `200 {itemId:B1,shelfStatus:ON_SHELF,catalogVersion:n}` |
+| 待下架/下架 | item 状态 `UNLISTING_PENDING`/`OFF_SHELF` | `200` 且精确返回状态；不能当作可借授权 |
+| 永久移除/未知 | BR/随机 ID | `404 BOOK_NOT_FOUND` |
+| 非服务身份/超时 | 无 mTLS 或 Catalog DB 不可用 | `401/403` 或 `503`；Lending fail-closed |
+
+#### E. `POST /internal/v1/catalog-items/{itemId}/borrow-leases`
+
+输入：mTLS Lending 身份、`Idempotency-Key: <borrow-operation-key>`、空 body。
+
+| 场景 | 预期输出 |
+|---|---|
+| 上架可申请 | `201 {leaseId,itemId:B1,catalogVersion,expiresAt}`，expiresAt 在配置 TTL 内 |
+| 相同 key 重试 | 返回原 `201` 和同一 leaseId，不能生成第二个 active lease |
+| 不同 key 并发申请 | 每个请求各自取得 lease；不修改名额或库存 |
+| 待下架/下架 | `409 BOOK_UNAVAILABLE`，不建 lease |
+| 不存在/移除 | `404 BOOK_NOT_FOUND` |
+| DB/服务故障或 mTLS 失败 | `503 DEPENDENCY_UNAVAILABLE` 或 `401/403`；不允许绕过 lease 借阅 |
+| 下架与申请竞态 | 串行化结果只能是先拿到 lease 后下架等待，或先进入待下架后拒绝申请；不得在下架完成后返回新 lease |
+
+#### F. `DELETE /internal/v1/catalog-items/{itemId}/borrow-leases/{leaseId}`
+
+| 场景 | 输入 | 预期输出 |
+|---|---|---|
+| 正常释放 | 有效 Lending mTLS、有效 lease | `204`；数据库状态 RELEASED，随后待下架流程可继续 |
+| 重复释放 | 同一 lease 再 DELETE | `204`，幂等，无负计数/重复事件 |
+| 已过期/不存在 lease | 有效服务身份 | `204`，不改变其他 lease |
+| lease 与 item 不匹配/无权服务身份 | 路径篡改/无 mTLS | `404` 或 `401/403`，不能释放他人 lease |
+| Catalog DB 故障 | 注入失败 | `503`；Lending 重试，TTL 最终回收 |
+
+#### G. `GET /api/v1/categories`
+
+| 场景 | 输入 | 预期输出 |
+|---|---|---|
+| 有上架分类 | 默认参数 | `200`，仅返回至少有一条上架内容的分类，页大小≤100，稳定 `name,id` 排序 |
+| 空馆藏/分类无上架条目 | 无可见分类 | `200 {items:[],page:1,total:0}` |
+| 分页/排序合法边界 | `page=2&pageSize=100&sort=name_asc` | `200`，分页合法；无结果越界回第一页 |
+| 非法分页/排序 | `page=0`、未知 sort 或 pageSize>100 | `400 INVALID_QUERY` |
+| 匿名访问 | 无 Token | `200`；目录浏览是公开接口 |
+| OpenSearch/MySQL 不可用 | 注入依赖故障 | `500/503` 标准系统错误，不伪造分类结果 |
+
+#### H. `GET /api/v1/books`
+
+| 场景 | 输入 | 预期输出 |
+|---|---|---|
+| 默认浏览 | 无 query | `200`，只含 ON_SHELF，按 `publishedAt desc,title asc,id asc`；每页默认 20 |
+| 每类字段检索 | `q=作者甲`、标题词、主题词分别请求 | `200`，完整输入做包含匹配；大小写/常见全半角统一；首尾 trim |
+| 空白关键词 | `q=%20%20` | 等同无关键词，保留其他筛选 |
+| 长度限制 | 100 Unicode 字符/101 字符 | 100 字符正常查询；101 返回 `400 INVALID_QUERY`，不截断、不放宽查询 |
+| 多筛选交集 | categoryId + EBOOK + AVAILABLE | 所有结果同时满足三条件；库存投影先过滤后分页并带 `availabilityAsOf` |
+| 暂不可借 | `availability=UNAVAILABLE` | 仅返回投影名额=0 条目；列表状态为 UNAVAILABLE |
+| 下架/零结果 | 搜索仅匹配 BO 或不存在关键词 | 下架不出现；空集 `200 items=[] total=0 page=1`，筛选上下文不变 |
+| 稳定排序/边界页 | 上架时间、标题相同；筛选后请求过大页码 | ID 作为最终并列排序；回最后有效页，空集回第 1 页 |
+| 无 Token/非法参数 | 匿名；非法 type/sort/page | 匿名 `200`；非法参数 `400 INVALID_QUERY` |
+| 搜索服务故障 | OpenSearch 超时/重建切换 | `503/500`，不将下架/全量数据作为降级结果；Trace ID 可关联 |
+
+#### I. `GET /api/v1/books/{id}`
+
+| 场景 | 输入 | 预期输出 |
+|---|---|---|
+| 上架有库存/无库存 | B1/B0 | `200`；返回完整可用元数据、`availableCount`、AVAILABLE/UNAVAILABLE、借阅规则 |
+| 下架 | BO | 按当前公开详情约定 `404 BOOK_NOT_FOUND`；不得显示新借入口 |
+| 移除/随机 ID | BR/不存在 | `404 BOOK_NOT_FOUND`；不泄露其他用户历史 |
+| 元数据字段缺失 | 标题存在但 publisher/cover 等为空 | `200`，缺失字段省略或 null，不能伪造默认出版信息 |
+| 电子书/期刊 | ISBN 与 issue identifier 分别存在 | `200`，type 和对应 identifier 正确；期刊按单期显示 |
+| 下游故障 | Catalog DB 或可借数依赖不可用 | `503`；不得把旧库存显示为确定可借（允许带时间戳的投影须遵循 API 契约） |
+
+#### J. `POST /api/v1/loans`
+
+输入：Bearer JWT、唯一 `Idempotency-Key`、`{"catalogItemId":"B1"}`。
+
+| 场景 | 预期输出与数据断言 |
+|---|---|
+| 全部校验通过 | `201`，返回唯一 loanId、B1 快照、借阅时间、应还日 `2026-11-11T23:59:00+08:00`、ACTIVE；MySQL Loan 插入、一个 Slot→LOANED，outbox 一条 |
+| 账号冻结/未核验/注销 | `403 ACCOUNT_NOT_ELIGIBLE`；无 Loan、Slot、额度变更；lease 已释放 |
+| 有逾期项 | U3 请求 → `409 OVERDUE_LOANS_EXIST`；库存和记录不变 |
+| 达 5 项额度 | U4 请求 → `409 LOAN_LIMIT_EXCEEDED`；库存和记录不变 |
+| 已借同条目 | U1 已有 B1 有效 Loan → `409 DUPLICATE_ACTIVE_LOAN`；无新增记录 |
+| 条目下架/移除 | lease 被拒绝 → `409 BOOK_UNAVAILABLE` 或 `404 BOOK_NOT_FOUND`；无 DB 写副作用 |
+| 零库存/最后名额被抢 | B0 或并发失败者 → `409 BOOK_UNAVAILABLE`；无 Loan/额度/Slot 变化 |
+| Account/Catalog 超时 | `503 DEPENDENCY_UNAVAILABLE`；fail-closed，lease 若已取得必须释放/TTL 回收 |
+| 缺少/格式错误 body、缺少 Idempotency-Key、关键词外字段 | `400 INVALID_REQUEST`；无远程 lease或事务写 |
+| 缺失/无效 Token | `401 UNAUTHENTICATED`；不触达业务数据库 |
+| 同 key 同 body 重试 | 重放原 HTTP `201` 和相同 loanId；只一条 Loan/一条有效 Slot 占用 |
+| 同 key 不同 body | `409 IDEMPOTENCY_KEY_REUSED`；不修改第一次结果 |
+| 不同 key 重复借同一本 | `409 DUPLICATE_ACTIVE_LOAN`；部分唯一索引兜底 |
+| 事务中注入 SQL/提交失败 | `500/503`；Loan、Slot、幂等结果、Outbox 全回滚，lease 释放 |
+| 两人竞争最后名额 N 路 | 并发集成测试：恰 1 个 `201`，N-1 个 `409 BOOK_UNAVAILABLE`；仅一条有效 Loan，Slot 不超借 |
+| 同一用户并发借不同条目 | 超过上限的请求串行判定；最终 active count≤5 |
+
+#### K. `POST /api/v1/loans/{id}/return`
+
+输入：Bearer JWT、`Idempotency-Key`、空 JSON `{}`。
+
+| 场景 | 预期输出与数据断言 |
+|---|---|
+| 到期前归还 | `200 status=RETURNED,returnedAt=now`；Loan 完成、Slot 仅释放一次 |
+| `now == dueAt` 或之后 | `200 status=RETURNED_LATE`；保留真实 returnedAt，逾期历史可见 |
+| 逾期有效 Loan 归还 | `200 RETURNED_LATE`；若无其他逾期，新增借阅限制解除 |
+| 非本人/不存在 | `404 LOAN_NOT_FOUND`；不泄露记录是否存在，不改 Loan/Slot |
+| 已归还 | 新 key → `409 LOAN_ALREADY_RETURNED`；不重复增加库存 |
+| 下架/永久移除的条目仍持有有效 Loan | `200` 成功归还；使用 Loan.slot_id 释放名额，Catalog 状态不被改回上架 |
+| 重复同 key | 重放原 `200` 和原 returnedAt；Slot 不重复释放 |
+| 其他逾期项仍在 | 当前还书成功但列表仍有 OVERDUE；借阅继续被限制 |
+| 缺 Token/无 Idempotency-Key/非法 loanId | 分别 `401`/`400`；无状态变化 |
+| DB 在写 Loan 后释放 Slot 前失败 | `500/503`；整个 InnoDB 事务回滚，记录仍有效且 Slot 仍 LOANED |
+| 并发双归还 | 同时提交仅一个状态变更与名额释放；另一请求重放/409，无重复库存 |
+
+#### L. `GET /api/v1/users/{userId}/loans`
+
+| 场景 | 输入 | 预期输出 |
+|---|---|---|
+| 进行中 | `status=ACTIVE` | `200`，仅未到期有效项，dueAt 升序 + ID；含 RETURN action |
+| 已逾期 | `status=OVERDUE` | `200`，now≥dueAt 且未归还项；刚到期 days=0，时间采用馆区时区 |
+| 已完成 | `status=COMPLETED` | `200`，RETURNED/RETURNED_LATE，returnedAt 倒序，不含 RETURN action |
+| 全部/空列表 | 不传 status / 用户从未借阅 | `200`，按状态分组字段或空 `items=[] total=0`，不得报 404 |
+| 时间和并列边界 | dueAt==now、同 dueAt/returnedAt 多记录 | 归逾期；按 loanId 稳定排序；分页无重无漏 |
+| 本人历史条目已下架/移除 | 对应记录存在 | `200`，从快照返回 title/creator/type，并标识 `catalogStatus` |
+| path userId 伪造/他人 ID | userId≠JWT subject | `404`，不泄露他人记录 |
+| 未登录/非法 status/page/sort | 缺 token 或非法 query | `401` 或 `400 INVALID_QUERY` |
+| 查询依赖故障 | Lending DB 不可用 | `503/500`，不返回其他用户缓存 |
+
+#### M. `GET /api/v1/loans/{loanId}`
+
+| 场景 | 输入 | 预期输出 |
+|---|---|---|
+| 本人有效未逾期/逾期 | U1+loanId | `200`，快照、dueAt、动态状态 ACTIVE/OVERDUE、RETURN action |
+| 本人已完成 | U1+完成 loanId | `200`，returnedAt、RETURNED/RETURNED_LATE，只读 |
+| Catalog 删除或下架 | Loan 快照仍存在 | `200`，仍展示历史识别字段和归还能力（若有效） |
+| 他人/不存在 | U2 查询 U1 loanId 或随机 ID | `404 LOAN_NOT_FOUND`，响应一致 |
+| 未登录/数据库故障 | 缺 token/注入故障 | `401` 或 `503/500` |
+
+#### N. `GET /api/v1/loan-operations/{idempotencyKey}`
+
+| 场景 | 输入 | 预期输出 |
+|---|---|---|
+| 操作处理中 | 同一用户、key 已登记处理中 | `200 state=PROCESSING`，不返回他人数据 |
+| 成功/拒绝完成 | key 已有终态 | `200 state=COMPLETED|REJECTED`，httpStatus 和 result 与原 POST 完全一致 |
+| 未知 key/过期清理后 | 当前用户查询不存在 key | `404 OPERATION_NOT_FOUND` |
+| 他人 key | 不同用户相同 key | `404`，不可枚举操作 |
+| 非法 key/缺 Token/DB 故障 | 格式错/无认证/故障 | `400 INVALID_IDEMPOTENCY_KEY`、`401`、`503/500` |
+
+#### O. 跨服务事件契约测试（非 HTTP API）
+
+`AccountStatusChanged`、`CatalogItemPublished/MetadataChanged/Unlisted`、`LoanBorrowed/Returned/ReturnedLate` 均需测试：合法 schema 版本可消费；缺字段/未知必填枚举进 DLQ；相同 eventId 二次投递只应用一次；同 aggregateVersion 重复无变化；旧版本不得覆盖新状态；版本缺口触发重放/告警；消费者处理失败事务回滚 Inbox 与投影；Outbox 业务提交原子性；对象资产事件不会泄露 object key 给未授权消费者。
+
+#### P. 运维端点测试（仅集群内网）
+
+| 接口 | 输入/场景 | 预期输出 |
+|---|---|---|
+| `GET /actuator/health/liveness` | 进程存活，即使下游 DB 暂时断开 | `200 UP`；不因下游短暂故障触发容器重启风暴 |
+| `GET /actuator/health/readiness` | MySQL/Kafka 等必要依赖可用/不可用 | 可用 `200 UP`；不可接流量时 `503 DOWN` 并列内部组件状态，不泄露凭证/主机秘密 |
+| `GET /actuator/prometheus` | 内网 Prometheus 抓取 | `200` 合法 exposition；包含 API/DB/锁等待/Outbox lag 指标，不包含 userId、Token、完整 object key 等高基数/敏感标签 |
+| 任意 actuator 从公网或未授权网络访问 | 无内网身份/错误网络策略 | 网络层拒绝或 `401/403`；端点不暴露给读者 |
 
 ## 4. 程序码结构与组织规范 (Code Organization)
 
@@ -747,7 +1207,7 @@ src/test/java/.../{domain,application,adapter,contract,e2e}
 | 分布式消息 | Outbox 与业务事务原子性；Broker 不可用时 Outbox 积压但核心借还成功；Relay 崩溃后重发；Inbox 去重；消费者重启和死信重放；重复/乱序/旧版本事件不回滚新投影；毒消息隔离与告警。 |
 | Account/安全 | 正常/冻结/待核验/注销状态读写；状态变更事件重复、乱序和传播延迟；资格 API 超时/熔断/异常码；过期投影 fail-closed；JWT 过期/签名错误/错误 issuer/audience；accountId 伪造；越权读写；速率限制；注入、敏感信息日志脱敏。 |
 | 数据与恢复 | MySQL 向前/向后兼容迁移；generated column 唯一约束；备份/PITR 恢复；服务重启后幂等可查；InnoDB Cluster 主节点切换及复制延迟；读写路由一致性；连接池耗尽；事务超时；对象存储版本恢复/校验失败；时钟偏差监控；数据修复与审计。 |
-| 大数据/容量 | 目录 10x/100x 数据增长下 OpenSearch 查询与重建；热点条目最后名额锁竞争；大量 Loan 历史归档前后用户分页一致；多馆 `library_id` 分片路由与跨馆拒绝；Kafka 回放/积压恢复；数 TB 文件 Range 读取、CDN 缓存命中/失效、对象存储故障切换；数据湖 CDC 延迟与脱敏验证；全量压测和容量告警。 |
+| 大数据/容量 | 目录 10x/100x 数据增长下 OpenSearch 查询与重建；热点条目最后名额锁竞争；大量 Loan 历史归档前后用户分页一致；多馆 `library_id` 分片路由与跨馆拒绝；Kafka 回放/积压恢复；数 TB 文件 Range 读取、CDN 缓存命中/失效、对象存储故障切换；受限只读副本导出一致性与脱敏验证；全量压测和容量告警。 |
 | 可观测性与性能 | Trace 跨 Gateway/服务/消息传播；指标标签不含高基数用户 ID；借还 p95/p99、错误率、锁等待与 Outbox lag；分页/搜索负载测试；突发并发与容量压测；readiness/liveness 正确区分依赖故障。 |
 
 关键 E2E：目录搜索 → 详情 → 借阅 → 网络超时以相同 key 查询/重试 → 本人借阅列表 → 到期投影 → 逾期归还 → 已完成历史；另覆盖下架后仍可归还和最后名额竞争。测试数据使用固定 Clock 与可控事件发布器，避免依赖真实等待到期。
