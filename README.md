@@ -17,21 +17,62 @@
 ```
 
 - **common** — 共享契约与基础：统一响应/异常/分页、JWT 资源服务器、时钟、Flyway 迁移、借阅策略配置（`elibrary.loan.*`）、MyBatis UUID 处理器。
-- **account** — 账号资格查询 `GET /accounts/me`；账号创建/冻结/注销由受信任渠道完成，不开放读者 API。
-- **catalog** — 目录：分类、检索、详情 `GET /categories`、`GET /books`、`GET /books/{id}`。
-- **lending** — 借阅/归还/个人记录/幂等结果：`POST /loans`、`POST /loans/{id}/return`、`GET /users/{userId}/loans`、`GET /loans/{id}`、`GET /loan-operations/{key}`。
+- **account** — 账号资格服务：查询读者账号状态与借阅资格。
+- **catalog** — 目录服务：浏览分类、检索书籍、查看书籍详情。
+- **lending** — 借阅服务：借阅、归还、个人借阅记录、幂等操作结果查询。
 
 模块间只通过 Java 接口调用（`AccountAccessPort`、`CatalogReadPort`、`CatalogInventoryPort`、`LoanCountPort`、`LendingPolicyPort`）；沿模块边界即可拆分为独立部署单元。
 
+## 服务描述与接口
+
+### account（账号服务）— `:8081`
+
+读者账号与借阅资格查询。账号的创建/冻结/注销由受信任渠道完成，不开放读者 API。
+
+| 接口 | 认证 | 功能 |
+|---|---|---|
+| `GET /api/v1/accounts/me` | 必须 | 返回本人账号状态（`status`）、资格等级（`eligibilityLevel`）、是否可借（`borrowingEligible`）、不可借原因（`eligibilityReasons`）、当前有效借阅数（`activeLoanCount`）与上限（`activeLoanLimit`） |
+
+**内部依赖**：通过 `LoanCountPort` 调用 lending 统计有效/逾期借阅数；通过 `LendingPolicyPort` 读取借阅上限。
+
+### catalog（目录服务）— `:8082`
+
+书籍目录浏览与检索，匿名可访问。
+
+| 接口 | 认证 | 功能 |
+|---|---|---|
+| `GET /api/v1/categories` | 匿名 | 分类列表（仅含上架条目的 ACTIVE 分类，按 `sortOrder` 排序） |
+| `GET /api/v1/books` | 匿名 | 检索/筛选/分页目录：`q` 关键词（NFKC 归一化、`%`/`_` 转义、≤100 字符）、`categoryId`、`type`（EBOOK/PERIODICAL）、`availability`（仅可借）、`sort`（publishedAt_desc/title_asc/title_desc）、`page`/`pageSize`（≤100） |
+| `GET /api/v1/books/{id}` | 匿名 | 书籍详情：书目元数据、库存状态（`availability`）、借阅规则（`loanPolicy`：借期/应还时刻/时区/上限） |
+
+**内部依赖**：详情接口通过 `LendingPolicyPort` 读取借阅规则展示给读者。
+
+### lending（借阅服务）— `:8083`
+
+借阅/归还/个人记录/幂等结果，是业务核心，跨模块调用 account 与 catalog。
+
+| 接口 | 认证 | 功能 |
+|---|---|---|
+| `POST /api/v1/loans` | 必须 | 借阅书籍（需 `Idempotency-Key`）：校验资格→逾期→上限→重复→库存，成功则落 Loan 并扣库存，返回 `201` |
+| `POST /api/v1/loans/{id}/return` | 必须 | 归还（需 `Idempotency-Key`）：锁 Loan→写归还状态（逾期则 `RETURNED_LATE`）→回补库存，返回 `200` |
+| `GET /api/v1/users/{userId}/loans` | 必须且本人 | 个人借阅列表，`status` 筛选（ACTIVE/OVERDUE/COMPLETED），含剩余/逾期天数 |
+| `GET /api/v1/loans/{id}` | 必须且本人 | 单条借阅详情（含书目快照、状态、天数） |
+| `GET /api/v1/loan-operations/{idempotencyKey}` | 必须且本人 | 查询幂等操作结果（网络结果未知时取回原响应） |
+
+**内部依赖**：借阅/归还通过 `AccountAccessPort` 锁读者、`CatalogReadPort` 锁条目、`CatalogInventoryPort` 调整库存；`LendingPolicyPort` 提供借阅规则默认实现。
+
 ## 快速开始
 
-### 1. 仅数据库用 Docker（推荐本地开发）
+> **Docker 方案**：`compose.yaml` 仅提供 MySQL 8.4（数据库用 Docker），三个服务在本地 JVM 启动。
+> 镜像构建（`Dockerfile`）仅用于生产部署，本地开发不构建镜像。
+
+### 1. 启动数据库（Docker）
 
 ```bash
 docker compose up -d mysql        # 启动 MySQL 8.4（端口 3306）
 ```
 
-### 2. 本地启动三个服务
+### 2. 本地启动三个服务（JVM）
 
 ```bash
 export DB_URL='jdbc:mysql://127.0.0.1:3306/elibrary_db?connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true'
@@ -44,12 +85,6 @@ export JWT_ISSUER_URI=https://issuer.example.com JWT_AUDIENCE=elibrary-api
 ```
 
 健康检查：`curl localhost:8081/actuator/health/readiness`（catalog/lending 同理）。
-
-### 3. 全部用 Docker 启动（镜像构建较慢）
-
-```bash
-docker compose up --build        # mysql + account + catalog + lending
-```
 
 ## 配置项
 
@@ -70,10 +105,45 @@ docker compose up --build        # mysql + account + catalog + lending
 ## 测试
 
 ```bash
-./gradlew test        # 单元测试 + Testcontainers 集成测试（无 Docker 时自动跳过）
+./gradlew test        # 单元测试 + SQLite 功能测试 + Testcontainers 集成测试（无 Docker 时自动跳过）
 
 # 或在容器内跑指定服务测试（可选）
 SERVICE=lending docker compose -f compose.test.yaml run --rm test
+```
+
+### 功能测试（SQLite）
+
+覆盖 README「需求场景与调用链」与 [docs/curl-scenarios.md](./docs/curl-scenarios.md) 全部场景的功能测试位于
+`lending/src/test/java/com/elibrary/lending/sqlite/`，使用**内存 SQLite**（`sqlite-jdbc`）替代 MySQL，
+无需 Docker 即可运行：
+
+| 测试类 | 覆盖场景 |
+|---|---|
+| `AccountEligibilityScenarioTest` | 账号资格（正常/冻结/逾期/不存在） |
+| `CatalogScenarioTest` | 目录浏览/检索/筛选/分页/详情（18 个场景） |
+| `BorrowScenarioTest` | 借阅（幂等/冻结/逾期/借满/库存/下架/移除/非法 ID） |
+| `ReturnScenarioTest` | 归还（正常/重复/他人/逾期/不存在/移除条目） |
+| `LoanQueryScenarioTest` | 个人记录（状态筛选/越权）+ 幂等操作查询 |
+
+```bash
+# 仅运行 SQLite 功能测试
+./gradlew :lending:test --tests "com.elibrary.lending.sqlite.*"
+```
+
+> SQLite 版 Mapper 实现主接口（`AccountMapper`/`CatalogMapper`/`LoanMapper`/`IdempotencyMapper`），
+> 通过 `@TestConfiguration` 的 `@Primary` bean 覆盖，业务逻辑（`BorrowLoan`/`ReturnLoan`/查询服务）零改动复用。
+
+### 端到端场景验证（curl）
+
+覆盖全部 API 场景的 curl 调用文档见 [docs/curl-scenarios.md](./docs/curl-scenarios.md)，
+自动断言脚本为 `scripts/verify-scenarios.sh`（52 个场景，已全部验证通过）：
+
+```bash
+# 1. 重置测试数据（脚本会改变数据库状态，每次运行前执行）
+docker exec -i library-service-mysql-1 mysql -uelibrary -pelibrary-local elibrary_db < scripts/reset-test-data.sql
+
+# 2. 运行验证（需三服务运行中 + JWT + JWK 服务器）
+./scripts/verify-scenarios.sh
 ```
 
 ## 构建
@@ -82,8 +152,10 @@ SERVICE=lending docker compose -f compose.test.yaml run --rm test
 ./gradlew :account:bootJar :catalog:bootJar :lending:bootJar
 # 产出 account/build/libs/account-app.jar、catalog-app.jar、lending-app.jar
 
-# 单服务镜像
+# 单服务镜像（仅生产部署用，本地开发不构建）
 docker build --build-arg SERVICE=account -t elibrary-account .
+docker build --build-arg SERVICE=catalog -t elibrary-catalog .
+docker build --build-arg SERVICE=lending -t elibrary-lending .
 ```
 
 - Flyway 迁移：`common/src/main/resources/db/migration/`（禁止生产自动建表）。
@@ -118,3 +190,134 @@ docker build --build-arg SERVICE=account -t elibrary-account .
 
 > 本地联调 JWT：使用自签名 JWK 端点时，需将证书导入 JVM 信任库
 > （`keytool -import -trustcacerts -alias <name> -file <cert.pem> -keystore $JAVA_HOME/lib/security/cacerts`）。
+
+## 需求场景与调用链
+
+以下按需求拆解所有场景，说明每个场景的调用链流程。模块间调用均为**进程内 Java 接口调用**（当前单进程部署），沿端口契约即可拆为独立服务。
+
+### 场景 1：浏览书籍（目录检索）
+
+**需求**：读者浏览可借书籍列表。
+
+**调用链**：
+
+```mermaid
+sequenceDiagram
+    participant C as 读者(浏览器/客户端)
+    participant S as catalog:8082
+    participant DB as MySQL
+    C->>S: GET /api/v1/books?q=&categoryId=&type=&availability=&sort=&page=&pageSize=
+    S->>S: CatalogApplicationService.search()<br/>归一化关键词/校验参数
+    S->>DB: countOnShelf() + searchOnShelf()<br/>(仅 ON_SHELF 条目)
+    DB-->>S: 分页结果 + 总数
+    S-->>C: 200 { items, page, pageSize, total, sort }
+```
+
+**要点**：匿名可访问；关键词 NFKC 归一化、`%`/`_` 转义；`availability=true` 仅返回有库存条目；页码越界自动收敛到最后一页。
+
+### 场景 2：查询书籍详细资料
+
+**需求**：读者查看某本书的完整信息与借阅规则。
+
+**调用链**：
+
+```mermaid
+sequenceDiagram
+    participant C as 读者
+    participant S as catalog:8082
+    participant P as LendingPolicyPort(lending)
+    participant DB as MySQL
+    C->>S: GET /api/v1/books/{id}
+    S->>DB: findAvailableById()<br/>(仅 ON_SHELF 且存在)
+    DB-->>S: 书目元数据
+    S->>P: loanPolicy()  ← 借阅规则视图
+    P-->>S: loanDays/dueTime/timeZone/maxActiveLoans
+    S-->>C: 200 { 书目元数据, availability, loanPolicy }
+```
+
+**要点**：下架/移除/不存在的条目返回 `404 BOOK_NOT_FOUND`；非法 ID 返回 `400`；详情附带 `loanPolicy` 让读者借阅前了解规则。
+
+### 场景 3：借阅书籍
+
+**需求**：读者借阅一本可借的书。
+
+**调用链**（lending 跨模块调用 account 与 catalog，同一事务）：
+
+```mermaid
+sequenceDiagram
+    participant C as 读者
+    participant L as lending:8083
+    participant A as AccountAccessPort(account)
+    participant K as CatalogReadPort/InventoryPort(catalog)
+    participant DB as MySQL
+    C->>L: POST /api/v1/loans<br/>Authorization + Idempotency-Key + {catalogItemId}
+    L->>L: 校验幂等 key / 查幂等记录(重放则直接返回)
+    L->>A: lockById(accountId)  ← 行锁读者
+    A-->>L: ReaderAccount
+    L->>L: 资格校验(冻结→403)<br/>逾期校验(有逾期→409)<br/>上限校验(借满→409)<br/>重复借阅校验(→409)
+    L->>K: lockById(itemId)  ← 行锁条目
+    K-->>L: CatalogItem
+    L->>L: 下架/移除校验(→404)<br/>库存校验(无库存→409)
+    L->>DB: INSERT loan(ACTIVE) + 计算 dueAt
+    L->>K: decrementCopies(itemId)  ← 库存 -1
+    L->>DB: 保存幂等记录(201)
+    L-->>C: 201 { id, dueAt, activeLoanCount, ... }
+```
+
+**要点**：`Idempotency-Key` 必填（缺→400）；同 key 同载荷重放返回原结果 + `Idempotent-Replay: true`；同 key 异载荷→409；借阅与扣库存同事务，失败整体回滚。
+
+### 场景 4：归还书籍
+
+**需求**：读者归还已借的书。
+
+**调用链**：
+
+```mermaid
+sequenceDiagram
+    participant C as 读者
+    participant L as lending:8083
+    participant K as CatalogReadPort/InventoryPort(catalog)
+    participant DB as MySQL
+    C->>L: POST /api/v1/loans/{id}/return<br/>Authorization + Idempotency-Key
+    L->>L: 校验幂等 key / 查幂等记录(重放则直接返回)
+    L->>DB: lockById(loanId, accountId)  ← 行锁借阅记录
+    DB-->>L: Loan
+    L->>L: 已归还校验(→409)<br/>非本人/不存在(→404)
+    L->>DB: UPDATE loan → RETURNED / RETURNED_LATE
+    L->>K: lockById(itemId) + incrementCopies(itemId)  ← 库存 +1
+    L->>DB: 保存幂等记录(200)
+    L-->>C: 200 { status, returnedAt, availableCount, ... }
+```
+
+**要点**：逾期归还状态为 `RETURNED_LATE`；下架/移除的条目仍可归还（库存回补跳过）；归还与库存回补同事务。
+
+### 场景 5：查看目前已借阅的书籍
+
+**需求**：读者查看自己当前借阅的书籍（含逾期）。
+
+**调用链**：
+
+```mermaid
+sequenceDiagram
+    participant C as 读者
+    participant L as lending:8083
+    participant DB as MySQL
+    C->>L: GET /api/v1/users/{userId}/loans?status=ACTIVE|OVERDUE
+    L->>L: 校验 userId == JWT.sub(非本人→404)
+    L->>DB: findByAccount()<br/>ACTIVE: 未归还且未到期<br/>OVERDUE: 未归还且已到期
+    DB-->>L: Loan 列表(含书目快照)
+    L->>L: 计算剩余/逾期天数(馆区时区)
+    L-->>C: 200 { items, page, pageSize, total }
+```
+
+**要点**：`userId` 必须等于 JWT 的 `sub`（不信任请求体）；`status` 仅允许 ACTIVE/OVERDUE/COMPLETED（非法→400）；单条详情 `GET /loans/{id}` 同理须为本人；网络结果未知时可用 `GET /loan-operations/{key}` 取回借阅/归还原响应。
+
+### 场景与接口映射
+
+| 需求 | 主接口 | 涉及服务 |
+|---|---|---|
+| 浏览书籍 | `GET /books` | catalog |
+| 查询书籍详细资料 | `GET /books/{id}` | catalog（+ lending 借阅规则） |
+| 借阅书籍 | `POST /loans` | lending（+ account 资格 + catalog 库存） |
+| 归还书籍 | `POST /loans/{id}/return` | lending（+ catalog 库存） |
+| 查看目前已借阅的书籍 | `GET /users/{userId}/loans` | lending |

@@ -49,6 +49,10 @@ Nginx / 云 LB（TLS、限流、路由）
                           MySQL 8.4 / InnoDB（单库 elibrary_db）
 ```
 
+> **S3 兼容对象存储（未实现）**：电子书正文/封面等大文件存储不在 MVP 范围内。演进路线中预留
+> `book_assets` 表 + 短时签名 URL + CDN 方案（见第 10 章），本期 `catalog_items.cover_url` 仅存外部 URL 字符串，
+> 不接入 S3、不提供文件上传/读取接口。
+
 - 每个业务模块是**独立进程**（独立端口、独立启动类、独立 `bootJar`），可单独部署/扩容。
 - 三个服务共享 `common` 工程：统一响应/异常/分页、JWT 资源服务器、时钟、Flyway 迁移、借阅策略配置、MyBatis UUID 处理器。
 - 跨模块调用通过 **Java 接口（端口）** 完成，实现类由各服务按需装配（Spring `@Import` / AutoConfiguration），沿模块边界即可拆分为独立部署单元。
@@ -87,6 +91,7 @@ Nginx / 云 LB（TLS、限流、路由）
 | 可观测 | Spring Actuator + Micrometer/Prometheus；JSON 日志 + `traceId` | 保留最小闭环 |
 | 测试 | JUnit 5 + Testcontainers（MySQL 8.4） | **并发与锁测试必须用真实 MySQL，不用 H2** |
 | 部署 | Docker（`--build-arg SERVICE` 单服务镜像）+ Docker Compose | 本地开发：MySQL 在 Docker，服务在 JVM |
+| 对象存储 | S3 兼容对象存储 + CDN（**未实现**） | 演进预留：正文/封面大文件、短时签名 URL、`content-access` 接口（见第 10 章） |
 
 ### 通用约定
 
