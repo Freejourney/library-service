@@ -1,7 +1,7 @@
 # 电子图书馆服务 (E-Library Service) 后端技术设计文档
 
 > 版本：1.1（微服务修订版，基于 `product-doc.md`）
-> 范围：读者目录浏览、详情、借阅、归还、个人借阅记录。账号注册认证、目录维护、馆员后台、通知、阅读器、预约和罚金均不在本期实现范围。
+> 范围：读者账号状态查询、目录浏览/详情、借阅、归还、个人借阅记录。账号注册、凭证管理与身份认证可由统一身份平台承接；本系统包含 Account Service 作为账号资料及借阅资格权威模块。目录维护、馆员后台、通知、阅读器、预约和罚金不在本期范围。
 
 ## 1. 架构总览与设计思想 (Architecture & Overview)
 
@@ -11,10 +11,11 @@
 
 ```text
 读者端 → API Gateway（OIDC/JWT、限流、路由、Trace）
-          ├─ Catalog Service → Catalog DB（目录、分类、检索索引）
-          ├─ Lending Service → Lending DB（Loan、LoanSlot、幂等、资格投影）
-          └─ Identity Service（外部/既有系统；认证与账号状态权威）
+          ├─ Account Service → Account DB（读者账号、状态、借阅资格）
+          ├─ Catalog Service → Catalog DB + Search Index（目录、分类）
+          └─ Lending Service → Lending DB（Loan、LoanSlot、幂等、账号资格投影）
 
+Account ── AccountStatusChanged ───────────────────────────> Event Broker
 Catalog ── CatalogItemPublished/Unlisted/MetadataChanged ──> Event Broker
 Lending ── LoanBorrowed/LoanReturned ──> Event Broker / Outbox
           每个服务内部：API Adapter → Application → Domain → Repository Adapter
@@ -25,19 +26,306 @@ Lending ── LoanBorrowed/LoanReturned ──> Event Broker / Outbox
 - **API Gateway/BFF**：统一外部入口、JWT 校验、速率限制、请求关联 ID；不承载借阅业务规则。
 - **Catalog Service**：目录条目、分类、出版元数据、上下架、搜索与详情；拥有 Catalog DB 和搜索索引。馆藏维护 API 属本期外。
 - **Lending Service**：借阅/归还、借阅规则、名额库存、读者借阅读模型；拥有 Lending DB。借阅事务内原子提交 Loan 与 Slot 状态。
-- **Identity Service**：认证及账号生命周期权威；本期作为已有系统依赖，提供令牌身份与账号资格查询/事件。
+- **Account Service**：本系统账号资料、正常/冻结/待核验/注销状态及借阅资格权威；提供账号查询 API 和 `AccountStatusChanged` 事件。凭证签发、登录、密码/MFA 仍由 OIDC 身份提供方处理，Gateway 校验 JWT 后传递可信 subject。
 - **Event Broker**：持久化、至少一次投递的消息系统；Outbox/Inbox、事件版本、重试及死信队列为必需机制。
 
 目录查询结果中的可借数是 Lending 事件生成的最终一致读模型；借阅是否成功只由 Lending 在事务中检查最新 Slot 状态决定。读模型延迟时可显示 `availabilityAsOf` 时间戳，不可作为借阅承诺。
 
-### 技术栈与关键设计原则
+### 技术栈与选型原因
 
-- **语言与框架假设**：Java 21、Spring Boot 3、Spring MVC、Bean Validation、Spring Data JDBC/显式 SQL、OpenAPI 3；服务独立部署。
-- **数据存储**：每服务独立 PostgreSQL 16 数据库/Schema 与数据库账号；Catalog 可用 OpenSearch 维护检索投影。Redis 只用于缓存/限流，不是库存或幂等权威源。Flyway 管理迁移，时间字段存 UTC。
-- **认证边界**：由现有身份提供方验证登录态；服务从可信认证上下文取得 `userId`，不得信任请求体中的读者 ID。账号正常/冻结状态由账户端口读取，写用例在事务受理时重新验证。
-- **高内聚低耦合**：Catalog 管目录与元数据；Lending 独占借阅生命周期及可借名额；Identity 管身份资格。跨服务只通过版本化契约与事件交互。
+- **Java 21 + Spring Boot 3**：团队常见生态成熟，事务、校验、OpenTelemetry、消息消费与 OAuth Resource Server 支持完整，适合构建边界清晰的业务微服务；LTS 版本降低运行时升级风险。
+- **Spring MVC + Bean Validation + OpenAPI 3**：本业务是以请求/响应和数据库事务为主的 I/O 服务，阻塞式 MVC 与事务模型更直观；Bean Validation 统一参数校验，OpenAPI 同时作为客户端生成和契约测试来源。
+- **PostgreSQL 16**：支持事务、行级锁、部分唯一索引、约束和 `timestamptz`，可直接保障借阅额度、名额唯一占用与幂等等强一致不变量；成熟备份、复制和运维工具降低数据风险。
+- **Kafka（或兼容持久化消息的 RabbitMQ）**：用于跨服务状态传播、重放和削峰；本设计选 Kafka 作为事件日志默认方案，利用分区键和 offset 管理有序消费。低吞吐部署可使用 RabbitMQ，但须保留 Outbox、去重、重试和死信语义。
+- **OpenSearch**：用于大小写/全半角规范化后的字段包含搜索和分页排序，避免在高读目录检索场景下把复杂搜索负载压到交易数据库；其索引是可重建投影，不是目录事实源。
+- **Redis**：只用于 Gateway 限流、短期缓存或分布式读缓存；不能保存权威库存/借阅状态或唯一幂等记录，以免缓存失效造成超借。
+- **OpenTelemetry + Prometheus/Grafana**：以统一 Trace、Metrics、Logs 关联跨服务 API 与异步消息，降低分布式故障定位成本。
+- **数据库策略**：每服务独立 PostgreSQL 数据库/Schema、账号与迁移；Catalog 可配 OpenSearch。Flyway 管理迁移，时间字段存 UTC。
+- **认证边界**：OIDC 提供方签发 JWT；Account Service 管业务账号状态。服务从可信认证上下文取得 `userId`，不得信任请求体中的读者 ID。
+- **高内聚低耦合**：Catalog 管目录与元数据；Lending 独占借阅生命周期及可借名额；Account 管账号状态与资格；OIDC 只负责认证。跨服务只通过版本化契约与事件交互。
 - **单一职责**：Controller 只处理协议，Use Case 编排用例，领域对象维护不变量，Repository 实现持久化，统一异常映射 HTTP。
 - **时间与排序**：数据库时间字段用 `timestamptz`；业务日期由配置的 IANA 馆区时区计算。跨服务 Trace/Correlation ID 贯穿请求和事件；分页附唯一次级键。
+
+### 数据存储方案
+
+采用 Database-per-Service：每个业务服务只写自己的数据库，禁止跨库 JOIN、共享表和绕过服务 API 修改数据。部署初期可用同一 PostgreSQL 集群中的独立数据库/Schema 降低成本，但各服务使用独立账号、权限、连接池、迁移和备份策略；生产规模增长后可迁移到独立集群，服务契约不变。
+
+| 存储 | 所属服务 | 保存内容 | 一致性与用途 |
+|---|---|---|---|
+| PostgreSQL `account_db` | Account | `accounts`、账号状态、资格等级、版本、审计事件 | 账号状态唯一事实源；状态变更写 Outbox。 |
+| PostgreSQL `catalog_db` | Catalog | `catalog_items`、`categories`、类型化元数据、发布状态、Outbox | 目录主数据；读写一致性由 Catalog 本地事务保证。 |
+| OpenSearch `catalog_read` | Catalog | 上架条目搜索文档、分类聚合及可借数投影 | 可丢弃重建的检索投影；目录由 Catalog Outbox 更新，可借数由 Lending 事件更新，最终一致。 |
+| PostgreSQL `lending_db` | Lending | `catalog_item_projection`、`reader_eligibility_projection`、`loan_slots`、`loans`、`reader_loan_guard`、`idempotency_records`、`inbox`、`outbox` | Loan/Slot/幂等结果同库事务强一致；外部投影带源版本和更新时间。 |
+| Kafka `elibrary.*` topics | 平台 | 账号、目录、借还领域事件 | 至少一次投递；按 `accountId` 或 `catalogItemId` 分区，消费者去重并拒绝旧版本。 |
+| Redis（可选） | Gateway/读服务 | 限流桶、可丢弃热点缓存 | 缓存可随时失效；不作事实源。 |
+
+#### 核心关系模型与约束
+
+```text
+Account DB: accounts(account_id PK, status, eligibility_level, version, updated_at)
+Catalog DB: categories(category_id PK, name, status)
+            catalog_items(item_id PK, type, title, creator, category_id, metadata_json,
+                          shelf_status, published_at, version)
+Lending DB: catalog_item_projection(item_id PK, shelf_status, title, creator, type,
+                                    category_id, source_version, observed_at)
+            reader_eligibility_projection(account_id PK, status, source_version, observed_at)
+            loan_slots(slot_id PK, item_id, status, version)
+            loans(loan_id PK, account_id, item_id, slot_id, status, borrowed_at, due_at,
+                  returned_at, title_snapshot, creator_snapshot, type_snapshot,
+                  policy_version, version)
+            idempotency_records(account_id, operation, key, request_hash, state,
+                                http_status, response_json, created_at, expires_at)
+```
+
+关键索引/约束：`loans(account_id, due_at) WHERE returned_at IS NULL` 支持有效借阅及逾期查询；部分唯一索引 `(account_id,item_id) WHERE returned_at IS NULL` 禁止同条目重复有效借阅；`UNIQUE(slot_id) WHERE returned_at IS NULL` 确保名额至多被一个有效 Loan 占用；`loan_slots(item_id,status,slot_id)` 支持可用名额锁定；幂等表主键 `(account_id,operation,key)`，同键不同 `request_hash` 冲突；`returned_at`、终态与 `slot.status` 由约束和事务共同维护。大规模 `loans` 可按 `borrowed_at` 月度分区，但需先验证分区表唯一键限制与业务唯一索引设计；初期不分区以保持约束简单。
+
+目录元数据使用关系列保存核心检索/过滤字段，类型特有属性放版本化 JSONB 或类型子表；OpenSearch 文档经 Unicode NFKC、大小写折叠后建立标题/作者/主题字段。Loan 的展示快照与目录原始数据分开保存，永久删除 Catalog 数据后仍可还书和读历史。业务时间以 UTC Instant 写入，API 转为配置馆区时区；保留事件 ID、聚合版本、Trace ID 以支持审计、去重和重放。
+
+数据生命周期：借阅历史按馆方政策长期保留且用户不可修改删除；幂等响应保留期必须覆盖客户端最大重试窗口（建议 7 天，配置化），到期仅清理幂等记录，不删除 Loan；Outbox/Inbox 在确认消费并超过审计窗口后归档/清理；账号注销后的借阅历史按馆方隐私政策做去标识化，不能破坏归还与审计关联。备份需覆盖每个 DB，定期做 PITR 恢复演练；OpenSearch 从 Catalog DB/事件重建。
+
+### 业务场景系统交互与数据流转图
+
+以下图中的同步请求只承载用户当下需要的判定，事件用于传播可重建投影；所有写事件均由 Outbox Relay 在本地事务提交后发布。
+
+#### 0. 账号登录态与借阅资格读取
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor R as 读者
+  participant IDP as OIDC 身份提供方
+  participant GW as API Gateway
+  participant AS as Account Service
+  participant ADB as Account DB
+  participant K as Event Broker
+  participant L as Lending Service
+  participant LP as Lending 资格投影
+  R->>IDP: 登录并获取 Access Token
+  IDP-->>R: JWT（subject=accountId）
+  R->>GW: 带 JWT 请求
+  GW->>GW: 验签 issuer/audience/exp
+  GW->>AS: 读取账号状态（受保护 API）
+  AS->>ADB: 查询账号
+  ADB-->>AS: status/version
+  AS-->>GW: 状态及可展示资格
+  AS->>K: AccountStatusChanged（Outbox）
+  K-->>L: 至少一次投递
+  L->>LP: 幂等更新本地资格投影
+```
+
+#### 1. 目录搜索、分类筛选与分页
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor R as 读者
+  participant GW as API Gateway
+  participant C as Catalog Service
+  participant OS as OpenSearch
+  participant K as Event Broker
+  R->>GW: GET /books?q&categoryId&type&availability&page
+  GW->>C: 校验参数后转发
+  C->>OS: NFKC关键词 + 上架/筛选/排序查询
+  OS-->>C: IDs + 目录资料 + total
+  C-->>GW: 稳定分页响应（含可借数投影、ID 次级排序）
+  GW-->>R: 列表、总数、availabilityAsOf
+  Note over C,OS: availabilityAsOf 标注库存投影时间；最终借阅仍由 Lending 校验
+```
+
+分类列表 `GET /categories` 同样由 Catalog 查询上架条目分类聚合；不触发 Lending 写操作。可借状态筛选在 OpenSearch 的可用名额投影上完成，先过滤再分页，避免总数和页内容不一致；响应带 `availabilityAsOf`，借阅时仍必须重新验证。
+
+```mermaid
+sequenceDiagram
+  actor R as 读者
+  participant GW as API Gateway
+  participant C as Catalog Service
+  participant OS as OpenSearch
+  R->>GW: GET /books（分类/关键词/筛选）
+  GW->>C: 转发查询
+  C->>OS: 执行上架条目检索
+  alt 找到结果
+    OS-->>C: 条目页
+    C-->>GW: 200 + items
+  else 没有匹配项或分类无上架内容
+    OS-->>C: 空结果（total=0）
+    C-->>GW: 200 + items=[] + page=1
+  else 请求页码超过过滤后有效页数
+    OS-->>C: total 与最后有效页
+    C-->>GW: 回最后有效页
+  end
+  GW-->>R: 保留筛选上下文的结果或空状态
+```
+
+#### 2. 目录详情
+
+```mermaid
+sequenceDiagram
+  actor R as 读者
+  participant GW as API Gateway
+  participant C as Catalog Service
+  participant CDB as Catalog DB
+  participant L as Lending Service
+  R->>GW: GET /books/{id}
+  GW->>C: 获取可访问条目
+  C->>CDB: 读取上架目录详情
+  CDB-->>C: 元数据/状态
+  C->>L: 查询名额读模型
+  L-->>C: 可借数量和时间戳
+  C-->>GW: 详情、借阅规则、可借状态
+  GW-->>R: 返回详情（不含其他读者信息）
+```
+
+#### 3. 借阅成功、规则拒绝、无库存及未知结果重试
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor R as 读者
+  participant GW as API Gateway
+  participant A as Account Service
+  participant L as Lending Service
+  participant DB as Lending DB
+  participant C as Catalog Service
+  participant K as Event Broker
+  R->>GW: POST /loans + Idempotency-Key
+  GW->>A: 校验 JWT subject 对应账号为正常
+  A-->>GW: NORMAL + accountVersion
+  GW->>L: 转发 accountId、itemId、key
+  L->>DB: 开启事务，锁 idempotency/reader guard
+  L->>DB: 校验逾期、额度、重复借阅
+  L->>C: 带版本验证条目仍上架（失败关闭）
+  C-->>L: ON_SHELF + catalogVersion
+  L->>DB: 锁最早可用 Slot
+  alt 所有规则通过且有名额
+    L->>DB: 插入 Loan 快照、标 Slot 已借、写幂等结果和 Outbox
+    L->>DB: COMMIT
+    L-->>GW: 201 Loan + dueAt
+    L->>K: Outbox Relay 发布 LoanBorrowed
+  else 资格/逾期/额度/重复/库存检查失败
+    L->>DB: ROLLBACK，不生成 Loan、不改 Slot
+    L-->>GW: 对应 403/409 错误码
+  end
+  GW-->>R: 成功或可理解的拒绝结果
+  opt 提交成功但响应丢失
+    R->>GW: GET /loan-operations/{key} 或相同 key 重试
+    GW->>L: 查询原操作结果
+    L->>DB: 按 accountId+key 读取
+    L-->>R: PROCESSING/原成功/原拒绝，不产生第二笔操作
+  end
+```
+
+最后名额竞争由 Lending DB 对 item/Slot 的锁串行化；一位读者提交成功，其余请求读取最新状态后以 `BOOK_UNAVAILABLE` 失败。Catalog 下架事件也更新 Lending 投影；借阅时同步版本核验用于保护事件传播延迟窗口。
+
+#### 4. 归还（按时/逾期）与重复提交
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor R as 读者
+  participant GW as API Gateway
+  participant L as Lending Service
+  participant DB as Lending DB
+  participant K as Event Broker
+  R->>GW: POST /loans/{id}/return + key
+  GW->>L: accountId 来自可信 JWT
+  L->>DB: 开启事务，锁 Loan 并校验 owner/有效状态
+  alt 本人且有效
+    L->>DB: now < dueAt 判按时；now >= dueAt 判逾期
+    L->>DB: 写 returnedAt/终态、释放 Slot、保存幂等和 Outbox
+    L->>DB: COMMIT
+    L-->>GW: 200 RETURNED 或 RETURNED_LATE
+    L->>K: 发布 LoanReturned 事件
+  else 非本人/不存在/已归还
+    L->>DB: ROLLBACK，不改 Loan/Slot
+    L-->>GW: 404 或 409
+  end
+  GW-->>R: 归还结果、实际归还时间
+  Note over DB: 并发双归还只有持锁的首个请求释放名额
+```
+
+#### 5. 我的借阅列表、逾期动态状态与历史详情
+
+```mermaid
+sequenceDiagram
+  actor R as 读者
+  participant GW as API Gateway
+  participant L as Lending Service
+  participant DB as Lending DB
+  R->>GW: GET /users/{userId}/loans 或 /loans/{loanId}
+  GW->>L: 认证主体和查询条件
+  L->>L: 校验 userId 等于 JWT subject
+  L->>DB: 仅查本人 Loan 和保存的目录快照
+  DB-->>L: ACTIVE/完成记录及 dueAt/returnedAt
+  L->>L: 按馆区当前时间派生 OVERDUE、剩余/逾期自然日
+  L-->>GW: 分页数据/历史快照/可用操作
+  GW-->>R: 当前记录；已移除条目仍可识别并归还
+```
+
+#### 6. 目录下架/移除后的借还与投影传播
+
+```mermaid
+sequenceDiagram
+  participant C as Catalog Service
+  participant CDB as Catalog DB
+  participant K as Event Broker
+  participant L as Lending Service
+  participant LDB as Lending DB
+  C->>CDB: 状态改为 OFF_SHELF/REMOVED + Outbox
+  C->>K: CatalogItemUnlisted（itemId, version）
+  K-->>L: 至少一次投递
+  L->>LDB: Inbox 去重，按版本更新目录投影
+  Note over L,LDB: 新借阅拒绝；已有 Loan 快照不删除
+  L->>LDB: 读者归还仍有效 Loan
+  L->>LDB: 标记完成并释放 Slot
+```
+
+#### 7. 账号冻结/注销与新增借阅限制
+
+```mermaid
+sequenceDiagram
+  participant Admin as 账号管理方
+  participant A as Account Service
+  participant ADB as Account DB
+  participant K as Event Broker
+  participant L as Lending Service
+  participant LDB as Lending DB
+  actor R as 读者
+  Admin->>A: 冻结/注销账号（不属于读者端 API）
+  A->>ADB: 更新状态和 version + Outbox
+  A->>K: AccountStatusChanged
+  K-->>L: 传播状态变更
+  L->>LDB: 更新资格投影
+  R->>L: POST /loans
+  L->>A: 受理时同步确认最新状态
+  A-->>L: FROZEN/DELETED
+  L-->>R: 403 ACCOUNT_NOT_ELIGIBLE；库存和记录不变
+  Note over R,L: 查询公开目录仍可用；已有借阅仍可按账号政策归还
+```
+
+#### 8. 借阅/归还事件更新目录可借数投影
+
+```mermaid
+sequenceDiagram
+  participant R as 读者
+  participant L as Lending Service
+  participant LDB as Lending DB
+  participant O as Outbox Relay
+  participant K as Event Broker
+  participant C as Catalog Service
+  participant OS as OpenSearch
+  R->>L: 借阅或归还请求
+  L->>LDB: 原子提交 Loan、Slot、Outbox
+  LDB-->>L: COMMIT 成功
+  O->>LDB: 读取待发 Outbox
+  O->>K: 发布 LoanBorrowed/LoanReturned（itemId, aggregateVersion）
+  K-->>C: 至少一次投递
+  C->>C: Inbox 去重、检查版本、更新 availableCount 投影
+  C->>OS: upsert 搜索文档及库存时间戳
+  OS-->>C: 更新确认
+  Note over R,OS: 搜索展示可借数可短暂延迟；Lending 始终按实时 Slot 决定借阅成败
+```
+
+上图覆盖 PRD 的目录/分类筛选、详情、借阅成功和所有前置条件拒绝、最后名额争抢、重复请求/结果未知、按时及逾期归还、双重归还、本人历史、下架/移除、账号冻结等用户场景。无搜索结果、筛选后页码越界和空借阅记录属于同一查询链路的空结果/分页分支，由 Catalog/Lending 返回标准空页，不另做写流程。
 
 ## 2. 领域模型设计 (Domain Modelling)
 
@@ -48,12 +336,13 @@ Lending ── LoanBorrowed/LoanReturned ──> Event Broker / Outbox
 | `CatalogItem`（Catalog 聚合根） | `id`、`type`、`title`、`creator`、分类、主题、简介、出版资料、`shelfStatus`、`publishedAt`、`version` | 上下架；维护目录资料。下架禁止新借阅但不影响现存借阅/归还。 |
 | `LoanSlot`（Lending 内实体） | `id`、`catalogItemId`、`status`（AVAILABLE/LOANED/DISABLED）、`version` | 仅可用名额能分配；借出后关联唯一有效 Loan；释放时恢复可用。条目库存数由可用名额计数得出，不维护易失的重复计数。 |
 | `Loan`（聚合根） | `id`、`userId`、`catalogItemId`、`slotId`、状态、`borrowedAt`、`dueAt`、`returnedAt`、借阅资料快照、`version` | `returnAt(now)` 只可从有效状态执行；按 `now < dueAt` 判按时，否则逾期归还。有效状态派生为 `ACTIVE`/`OVERDUE`，完成状态为 `RETURNED`/`RETURNED_LATE`。 |
-| `ReaderAccount`（外部上下文投影） | `userId`、`accountStatus` | 仅代表资格查询结果；账户系统仍是账号状态权威来源。本期不实现账号注册/管理。 |
+| `ReaderAccount`（Account 聚合根） | `accountId`、状态、资格等级、`version`、审计字段 | 管理正常/冻结/待核验/注销状态；账号生命周期变更发布事件。凭证由 OIDC 管理。 |
+| `ReaderEligibilityProjection`（Lending 投影） | `accountId`、状态、源版本、更新时间 | 加速资格判断；最终借阅仍同步向 Account Service 确认。投影过期时 fail-closed。 |
 | `LoanPolicy`（值对象/策略） | 同时借阅上限 5、期限 14 个本地自然日、应还日 23:59:00、馆区 ZoneId | 计算借阅到期时刻；所有参数配置化并验证。 |
 | `BookMetadata` / `PeriodicalIssueMetadata`（值对象） | 类型化的 ISBN 或卷期标识、出版资料等 | 目录条目统一可借，但类型差异放在类型化元数据中；期刊按单期作为条目。 |
 | `IdempotencyKey`、`PageRequest`、`SearchCriteria` | 请求键、分页排序及检索条件 | 值相等，不承载可变状态。关键词 trim、Unicode 长度校验及规范化规则集中实现。 |
 
-`User` 不作为本服务可变实体：借阅所有权由不可伪造的 `userId` 标识。借阅历史保留 `titleSnapshot`、`creatorSnapshot`、`typeSnapshot` 等字段，即使目录条目被下架或永久移除，也能识别并归还。
+借阅所有权由可信 OIDC `subject/accountId` 标识。账号状态归 Account Service 管理，不在 Lending 重复维护账号主数据。借阅历史保留 `titleSnapshot`、`creatorSnapshot`、`typeSnapshot` 等字段，即使目录条目被下架或永久移除，也能识别并归还。
 
 ### 关联关系与聚合边界
 
@@ -81,7 +370,7 @@ Loan:         ACTIVE --[now >= dueAt，读时派生]--> OVERDUE
 
 借阅和归还都使用 Lending DB PostgreSQL `READ COMMITTED` 本地事务，并以固定锁顺序降低死锁：先锁读者借阅状态行（可设 `reader_loan_guard(user_id)`，不存在时用 upsert 建立），再锁本地目录资格投影/条目锁，最后锁名额或 Loan。锁的获取顺序定义业务受理顺序；并发争用最后名额时，最先取得该条目/可用名额锁并完成全部条件校验的请求为唯一成功者。
 
-借阅流程：Gateway 验 JWT → Lending 通过 Identity 同步资格接口确认账号正常（超时/不可达 fail-closed 为 503）→ Lending 接受请求并在本地事务锁 reader guard → 查本地逾期及有效数/重复项 → 校验由 Catalog 事件同步的上架与元数据投影 → 锁定可用 Slot → 插入 Loan 快照、更新 Slot、存幂等结果和 Outbox → commit。身份资格接口应有严格超时和熔断；账号状态事件更新本地资格投影，投影超过配置的新鲜度阈值时禁止新借阅。Catalog 下架事件到达前存在短暂传播窗口，因此 Lending 借阅时仍需核验本地 `catalogVersion`；若业务要求下架绝不被传播延迟穿透，应在受理时向 Catalog 做带版本的同步可借授权检查并 fail-closed。最终库存判断完全在 Lending 本地，不发生跨服务扣库存事务。
+借阅流程：Gateway 验 JWT → Lending 通过 Account 同步资格接口确认账号正常（超时/不可达 fail-closed 为 503）→ Lending 接受请求并在本地事务锁 reader guard → 查本地逾期及有效数/重复项 → 校验由 Catalog 事件同步的上架与元数据投影 → 锁定可用 Slot → 插入 Loan 快照、更新 Slot、存幂等结果和 Outbox → commit。账号资格接口应有严格超时和熔断；账号状态事件更新本地资格投影，投影超过配置的新鲜度阈值时禁止新借阅。Catalog 下架事件到达前存在短暂传播窗口，因此 Lending 借阅时仍需核验本地 `catalogVersion`；若业务要求下架绝不被传播延迟穿透，应在受理时向 Catalog 做带版本的同步可借授权检查并 fail-closed。最终库存判断完全在 Lending 本地，不发生跨服务扣库存事务。
 
 归还事务：以认证 userId 和 loanId 定位并锁定 Loan，确认所有权与有效状态；锁定对应 Slot；同一事务写入 `returnedAt`、终态并将 Slot 释放，保存幂等结果及 Outbox 后提交。事件发布失败由 Outbox Relay 重试，不回滚已提交借还；消费者以 eventId 去重并按聚合版本排序。重复归还不能二次释放。任一本地失败回滚完整事务。
 
@@ -97,6 +386,40 @@ Loan:         ACTIVE --[now >= dueAt，读时派生]--> OVERDUE
 - 页码从 1 开始；默认 `pageSize=20`、最大 100。超范围页码回到最后有效页，无结果时回第 1 页。排序仅允许白名单字段；服务端追加 ID 次级排序。
 - 目录检索：`q` 最多 100 Unicode 字符，首尾空白去除，纯空白视为空；大小写与常见全/半角差异归一化后，对标题/作者或主编/主题做完整输入子串匹配，不做分词。筛选条件交集。默认 `publishedAt desc,title asc,id asc`；可选 `title asc|desc`、`publishedAt desc`。
 - 借阅记录列表按 `status=ACTIVE|OVERDUE|COMPLETED` 筛选；有效记录默认 `dueAt asc,id asc`，完成记录 `returnedAt desc,id asc`。
+
+API 分成读者公开 API、服务间内部 API 与事件契约。登录/凭证 API 属 OIDC 提供方，不由本产品重复实现；Account Service 提供业务账号状态能力。
+
+### 0. 查询本人账号与借阅资格（Account Service）
+
+`GET /api/v1/accounts/me`。Header：`Authorization: Bearer …`。仅返回当前主体自己的读者账号摘要，不返回密码、凭证或其他敏感认证资料。
+
+```json
+{"code":"OK","message":"success","timestamp":"2026-10-29T10:00:00+08:00","traceId":"tr-acct-1","data":{"accountId":"usr_01","status":"NORMAL","borrowingEligible":true,"eligibilityReasons":[],"activeLoanLimit":5}}
+```
+
+状态码：`200`；`401 UNAUTHENTICATED`；`404 ACCOUNT_NOT_FOUND`（Token subject 无业务账号）；`503 DEPENDENCY_UNAVAILABLE`；`500 INTERNAL_ERROR`。冻结/待核验账号仍可读取自己的状态，返回 `200` 且 `borrowingEligible=false`，供 UI 解释限制。
+
+### 服务间账号资格 API（仅内网 mTLS）
+
+`GET /internal/v1/accounts/{accountId}/borrowing-eligibility`。调用方 Lending Service，采用 workload identity/mTLS；Gateway 不对公网开放。无请求体。成功响应：`{"accountId":"usr_01","status":"NORMAL","eligible":true,"accountVersion":18,"evaluatedAt":"2026-10-29T10:00:00Z"}`。`NORMAL` 为 eligible；`FROZEN`、`PENDING_VERIFICATION`、`DELETED` 为不可借。未知账号 `404`，Account 不可用 `503`。禁止将服务间 API 暴露为客户端接口。
+
+### 服务间目录/库存 API（仅内网 mTLS）
+
+- `POST /internal/v1/catalog/availability:batchGet`（Lending 提供）：Catalog 请求示例 `{"itemIds":["bk_01","bk_02"]}`；Lending 响应 `{"items":[{"itemId":"bk_01","availableCount":2,"version":31,"observedAt":"2026-10-29T10:00:00Z"}]}`。超过 100 个 ID 返回 `400`。用于详情/读模型补充，不作借阅授权。
+- `GET /internal/v1/catalog-items/{itemId}/lending-eligibility`（Catalog 提供）：Lending 借阅前按 `itemId` 读取上架状态。示例响应 `{"itemId":"bk_01","shelfStatus":"ON_SHELF","catalogVersion":42,"observedAt":"2026-10-29T10:00:00Z"}`。不存在/永久移除返回 `404`；Catalog 不可用返回 `503`，Lending fail-closed。该调用降低下架事件延迟造成的错误借阅窗口；Lending 自己仍是 Slot 数量和借阅成败的权威。
+- 两接口均需 mTLS、服务身份 allowlist、短超时、熔断和限流；不接受客户端传入的 `accountId` 作为授权主体。
+
+### 事件契约
+
+所有事件使用 CloudEvents 风格 envelope：`id, source, type, subject, time, dataschema, traceid, aggregateVersion, data`。事件包含 schema 版本，生产方先写本地 Outbox；消费者 Inbox 唯一约束按 `event.id` 去重，按聚合版本丢弃旧事件。核心事件：
+
+| 事件 | 生产方 → 消费方 | 用途 |
+|---|---|---|
+| `AccountStatusChanged.v1` | Account → Lending | 更新资格投影；状态含 accountId/status/version。 |
+| `CatalogItemPublished.v1`、`CatalogItemMetadataChanged.v1`、`CatalogItemUnlisted.v1` | Catalog → Lending、Search Index | 更新借阅目录投影与检索索引；含 itemId、状态、快照字段、version。 |
+| `LoanBorrowed.v1`、`LoanReturned.v1`、`LoanReturnedLate.v1` | Lending → Catalog read projection/审计消费者 | 更新可借数、分析或後续通知；不反向改变借阅事务结果。 |
+
+消息键分别使用 `accountId`、`itemId`、`itemId`，保证同一聚合内顺序。消费者必须容忍 at-least-once，处理事件失败指数退避重试，超过阈值进 DLQ 并告警；重放不得重复扣减库存，需以事件版本重算/应用投影。
 
 ### 1. 浏览/检索图书列表
 
@@ -197,6 +520,7 @@ Request：
 
 | 服务 | Method / Path | 认证 | 用途 |
 |---|---|---|---|
+| Account | `GET /api/v1/accounts/me` | 必须 | 查看本人账号状态及借阅资格 |
 | Catalog | `GET /api/v1/categories` | 可匿名 | 获取可用分类筛选项 |
 | Catalog | `GET /api/v1/books` | 可匿名 | 检索、过滤、分页目录 |
 | Catalog | `GET /api/v1/books/{id}` | 可匿名 | 查询当前可访问条目详情 |
@@ -205,18 +529,23 @@ Request：
 | Lending | `GET /api/v1/users/{userId}/loans` | 必须且本人 | 分页查询本人借阅列表 |
 | Lending | `GET /api/v1/loans/{id}` | 必须且本人 | 查询本人单条记录/历史快照 |
 | Lending | `GET /api/v1/loan-operations/{idempotencyKey}` | 必须且本人 | 查询操作是否完成及原结果 |
+| Account（内部） | `GET /internal/v1/accounts/{accountId}/borrowing-eligibility` | mTLS 服务身份 | Lending 受理借阅时确认实时资格 |
+| Lending（内部） | `POST /internal/v1/catalog/availability:batchGet` | mTLS 服务身份 | Catalog 批量读取可用名额读模型 |
+| Catalog（内部） | `GET /internal/v1/catalog-items/{itemId}/lending-eligibility` | mTLS 服务身份 | Lending 借阅前核验最新上架状态 |
 
-本期不提供身份注册/登录、馆藏增删改/上下架/名额管理、续借、预约、罚金、通知、阅读内容访问 API。健康检查和指标端点仅集群内部使用，不属于读者业务 API：`/actuator/health/liveness`、`/actuator/health/readiness`、`/actuator/prometheus`，经网络策略限制访问。
+本期不提供用户注册/登录、密码/MFA、馆藏增删改/上下架/名额管理、续借、预约、罚金、通知、阅读内容访问 API。账号创建及状态变更由受信任的账号管理渠道处理；账号查询与借阅资格由 Account Service 提供。健康检查和指标端点仅集群内部使用，不属于读者业务 API：`/actuator/health/liveness`、`/actuator/health/readiness`、`/actuator/prometheus`，经网络策略限制访问。
 
 ## 4. 程序码结构与组织规范 (Code Organization)
 
 ```text
 services/
   api-gateway/             # 路由、认证、限流、OpenAPI 聚合，不放业务规则
+  account-service/         # 账号状态、资格查询、账号事件
+    api/ application/ domain/ infrastructure/ db/migration/
   catalog-service/
     api/                   # CatalogController、请求/响应 DTO
     application/           # BrowseCatalog、GetCatalogItem、查询端口
-    domain/                # CatalogItem、LoanSlot、搜索规则、Repository 接口
+    domain/                # CatalogItem、搜索规则、Repository 接口
     infrastructure/        # SQL Mapper、Repository 实现
     db/migration/          # Catalog DB migrations
   lending-service/
@@ -225,7 +554,8 @@ services/
     domain/                # Loan、LoanSlot、LoanPolicy、Repository 接口、事件
     infrastructure/        # Lending DB、锁、幂等、Outbox/Inbox、Broker adapter
     db/migration/          # Lending DB migrations
-  identity-adapter/        # 对既有 Identity Service 的客户端与契约
+  oidc-adapter/            # JWT/OIDC Resource Server 配置，不存凭证
+  account-client/          # Lending 调用 Account API 的 mTLS 客户端与契约
   contracts/               # OpenAPI、事件 schema、兼容性检查
   platform/                # 本地开发 Compose、部署 chart、observability 配置
 ```
@@ -280,8 +610,8 @@ src/test/java/.../{domain,application,adapter,contract,e2e}
 
 - **Domain 单元测试**不启动 Spring；固定 Clock 和 ZoneId，边界值穷举。每个规则和状态转换必须有正向、拒绝、边界测试。
 - **Application 用例测试**用 fake/mock 端口验证步骤顺序、授权上下文、事务边界、幂等重放、依赖超时和错误映射。
-- **Adapter/集成测试**使用 Testcontainers PostgreSQL、Broker、OpenSearch（若启用）验证真实 SQL、消息确认/重试、索引投影。不能用 H2 替代并发与锁测试。
-- **契约测试**OpenAPI 与事件 schema 做兼容性检查；消费者驱动契约验证 Gateway、Catalog、Lending、Identity 之间的版本兼容。
+- **Adapter/集成测试**使用 Testcontainers PostgreSQL、Broker、OpenSearch 验证真实 SQL、消息确认/重试、索引投影。不能用 H2 替代并发与锁测试。
+- **契约测试**OpenAPI 与事件 schema 做兼容性检查；消费者驱动契约验证 Gateway、Account、Catalog、Lending 之间的版本兼容。
 - **端到端/故障测试**在临时环境验证完整用户旅程及服务中断/恢复；发布门禁包含迁移兼容性、SLO smoke test、安全扫描。
 
 #### 业务与边界场景矩阵
@@ -298,7 +628,7 @@ src/test/java/.../{domain,application,adapter,contract,e2e}
 | 借阅记录 | ACTIVE/OVERDUE/COMPLETED 分类正确；刚到期显示逾期 0 天；剩余自然日、少于 24h 显示即将到期；完成记录时间倒序；并列时间 ID 稳定排序；页边界无重无漏；只能访问本人；快照字段在 Catalog 删除后仍完整。 |
 | Catalog 服务 | 发布/更新/下架事件版本顺序；重复与乱序事件；重放恢复读模型；事件 schema 兼容；索引故障期间降级/告警；同步授权调用超时 fail-closed。 |
 | 分布式消息 | Outbox 与业务事务原子性；Broker 不可用时 Outbox 积压但核心借还成功；Relay 崩溃后重发；Inbox 去重；消费者重启和死信重放；重复/乱序/旧版本事件不回滚新投影；毒消息隔离与告警。 |
-| Identity/安全 | JWT 过期/签名错误/错误 issuer/audience；身份服务超时/熔断；资格投影过期 fail-closed；账号冻结事件传播；userId 伪造；越权读写；速率限制；注入、敏感信息日志脱敏。 |
+| Account/安全 | 正常/冻结/待核验/注销状态读写；状态变更事件重复、乱序和传播延迟；资格 API 超时/熔断/异常码；过期投影 fail-closed；JWT 过期/签名错误/错误 issuer/audience；accountId 伪造；越权读写；速率限制；注入、敏感信息日志脱敏。 |
 | 数据与恢复 | 向前/向后兼容迁移；备份恢复；服务重启后幂等可查；数据库主从切换；连接池耗尽；事务超时；时钟偏差监控；数据修复与审计。 |
 | 可观测性与性能 | Trace 跨 Gateway/服务/消息传播；指标标签不含高基数用户 ID；借还 p95/p99、错误率、锁等待与 Outbox lag；分页/搜索负载测试；突发并发与容量压测；readiness/liveness 正确区分依赖故障。 |
 
@@ -315,5 +645,5 @@ src/test/java/.../{domain,application,adapter,contract,e2e}
 - JSON 结构化日志字段：`timestamp`、`level`、`service`、`traceId`、`spanId`、`requestId`、`userIdHash`、`operation`、`catalogItemId`/`loanId`、`resultCode`、`durationMs`。不记录 Token、完整个人资料或请求密钥；用户 ID 如需关联使用受控散列。
 - INFO 记录成功借还及请求结果摘要；WARN 记录规则拒绝、重复请求和依赖异常；ERROR 记录未预期异常及堆栈。业务拒绝不打 ERROR，避免告警噪声。
 - 指标：借阅/归还成功与拒绝计数（按错误码）、事务时延、锁等待/死锁、可用名额、逾期有效借阅数、依赖可用性、数据库连接池与 API 延迟分位数。避免以 userId 等高基数字段作指标标签。
-- OpenTelemetry 贯穿 API、用例、数据库及身份服务；Trace ID 返回响应头/响应体并写入日志。提供 liveness/readiness、数据库连接与身份依赖健康检查；告警阈值由 SLO 及容量评估确定。
+- OpenTelemetry 贯穿 Gateway、Account、Catalog、Lending、数据库及 OIDC 依赖；Trace ID 返回响应头/响应体并写入日志。提供 liveness/readiness、数据库连接与关键依赖健康检查；告警阈值由 SLO 及容量评估确定。
 
