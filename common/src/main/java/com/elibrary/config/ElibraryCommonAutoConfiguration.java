@@ -1,5 +1,6 @@
 package com.elibrary.config;
 
+import com.elibrary.common.ApiErrorHandler;
 import com.elibrary.common.LendingPolicyPort;
 import com.elibrary.common.TraceFilter;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
@@ -10,7 +11,7 @@ import org.springframework.context.annotation.Import;
 
 /** 共享基础设施自动配置：安全、时钟、借阅策略默认实现（各服务自动加载）。 */
 @AutoConfiguration
-@Import({SecurityConfig.class, TimeConfig.class, TraceFilter.class})
+@Import({SecurityConfig.class, TimeConfig.class, TraceFilter.class, ApiErrorHandler.class})
 @EnableConfigurationProperties(LoanProperties.class)
 public class ElibraryCommonAutoConfiguration {
 
