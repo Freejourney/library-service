@@ -1,38 +1,43 @@
 # 电子图书馆服务 (E-Library Service) 后端技术设计文档
 
-> 版本：1.0（基于 `product-doc.md`）  
+> 版本：1.1（微服务修订版，基于 `product-doc.md`）
 > 范围：读者目录浏览、详情、借阅、归还、个人借阅记录。账号注册认证、目录维护、馆员后台、通知、阅读器、预约和罚金均不在本期实现范围。
 
 ## 1. 架构总览与设计思想 (Architecture & Overview)
 
 ### 架构选型与分层策略
 
-采用模块化单体 + Clean Architecture（端口与适配器）实现。本期业务量与事务边界适合单一部署单元；模块边界和领域依赖规则为后续拆分服务保留空间。依赖始终指向 Domain/Application，Domain 不依赖 Web、ORM 或外部服务。
+采用微服务体系架构，并在每个服务内部使用 Clean Architecture。服务按业务能力拆分，拥有独立部署、数据存储和扩缩容边界；禁止跨服务直接访问数据库。借阅名额与借阅记录必须由同一 Lending Service/数据库拥有，避免跨服务分布式事务。API Gateway 负责入口路由、限流和令牌校验，服务间通过同步 API 查询资格、通过事件传播目录元数据及读模型变更。
 
 ```text
-HTTP / OpenAPI
-    ↓
-API Adapter（认证上下文、DTO 校验、HTTP 映射）
-    ↓
-Application Use Cases（事务编排、授权、幂等、端口调用）
-    ↓
-Domain（实体、值对象、领域服务、规则、领域事件）
-    ↑                              ↓
-Infrastructure Adapters（SQL Repository、时钟、日志、追踪）
-    ↓
-PostgreSQL
+读者端 → API Gateway（OIDC/JWT、限流、路由、Trace）
+          ├─ Catalog Service → Catalog DB（目录、分类、检索索引）
+          ├─ Lending Service → Lending DB（Loan、LoanSlot、幂等、资格投影）
+          └─ Identity Service（外部/既有系统；认证与账号状态权威）
+
+Catalog ── CatalogItemPublished/Unlisted/MetadataChanged ──> Event Broker
+Lending ── LoanBorrowed/LoanReturned ──> Event Broker / Outbox
+          每个服务内部：API Adapter → Application → Domain → Repository Adapter
 ```
 
-读请求可以经查询服务投影到 DTO；写请求必须经过用例与聚合行为。借阅及归还在单个数据库事务中完成，不以异步消息作为库存/记录一致性的前提。提交后可通过事务性 Outbox 发布审计或通知事件（本期若未接通知消费者，可只记录 Outbox）。
+服务职责：
+
+- **API Gateway/BFF**：统一外部入口、JWT 校验、速率限制、请求关联 ID；不承载借阅业务规则。
+- **Catalog Service**：目录条目、分类、出版元数据、上下架、搜索与详情；拥有 Catalog DB 和搜索索引。馆藏维护 API 属本期外。
+- **Lending Service**：借阅/归还、借阅规则、名额库存、读者借阅读模型；拥有 Lending DB。借阅事务内原子提交 Loan 与 Slot 状态。
+- **Identity Service**：认证及账号生命周期权威；本期作为已有系统依赖，提供令牌身份与账号资格查询/事件。
+- **Event Broker**：持久化、至少一次投递的消息系统；Outbox/Inbox、事件版本、重试及死信队列为必需机制。
+
+目录查询结果中的可借数是 Lending 事件生成的最终一致读模型；借阅是否成功只由 Lending 在事务中检查最新 Slot 状态决定。读模型延迟时可显示 `availabilityAsOf` 时间戳，不可作为借阅承诺。
 
 ### 技术栈与关键设计原则
 
-- **语言与框架假设**：Java 21、Spring Boot 3、Spring MVC、Bean Validation、Spring Data JDBC/JPA（优先 JDBC/显式 SQL 控制锁与事务）、OpenAPI 3。
-- **数据存储**：PostgreSQL 16；Redis 非必需，不作为借阅库存或幂等的权威数据源。部署环境需支持数据库连接池、迁移工具（Flyway）及 UTC 存储。
+- **语言与框架假设**：Java 21、Spring Boot 3、Spring MVC、Bean Validation、Spring Data JDBC/显式 SQL、OpenAPI 3；服务独立部署。
+- **数据存储**：每服务独立 PostgreSQL 16 数据库/Schema 与数据库账号；Catalog 可用 OpenSearch 维护检索投影。Redis 只用于缓存/限流，不是库存或幂等权威源。Flyway 管理迁移，时间字段存 UTC。
 - **认证边界**：由现有身份提供方验证登录态；服务从可信认证上下文取得 `userId`，不得信任请求体中的读者 ID。账号正常/冻结状态由账户端口读取，写用例在事务受理时重新验证。
-- **高内聚低耦合**：Catalog 管目录与名额； Lending 管借阅生命周期； Identity Adapter 只提供账号资格；各模块通过应用端口和稳定 ID 交互。
+- **高内聚低耦合**：Catalog 管目录与元数据；Lending 独占借阅生命周期及可借名额；Identity 管身份资格。跨服务只通过版本化契约与事件交互。
 - **单一职责**：Controller 只处理协议，Use Case 编排用例，领域对象维护不变量，Repository 实现持久化，统一异常映射 HTTP。
-- **时间与排序**：数据库时间字段用 `timestamptz`；业务日期由配置的 IANA 馆区时区（如 `Asia/Shanghai`）计算，禁止使用 JVM 默认时区。分页必须附唯一次级键保证稳定结果。
+- **时间与排序**：数据库时间字段用 `timestamptz`；业务日期由配置的 IANA 馆区时区计算。跨服务 Trace/Correlation ID 贯穿请求和事件；分页附唯一次级键。
 
 ## 2. 领域模型设计 (Domain Modelling)
 
@@ -40,8 +45,8 @@ PostgreSQL
 
 | 类型 | 关键属性 | 行为/约束 |
 |---|---|---|
-| `CatalogItem`（聚合根） | `id`、`type`、`title`、`creator`、分类、主题、简介、出版资料、`shelfStatus`、`publishedAt`、`version` | 上下架；维护目录快照资料。下架禁止新借阅但不影响现存借阅/归还。 |
-| `LoanSlot`（名额实体） | `id`、`catalogItemId`、`status`（AVAILABLE/LOANED/DISABLED）、`version` | 仅可用名额能分配；借出后关联唯一有效 Loan；释放时恢复可用。条目库存数由可用名额计数得出，不维护易失的重复计数。 |
+| `CatalogItem`（Catalog 聚合根） | `id`、`type`、`title`、`creator`、分类、主题、简介、出版资料、`shelfStatus`、`publishedAt`、`version` | 上下架；维护目录资料。下架禁止新借阅但不影响现存借阅/归还。 |
+| `LoanSlot`（Lending 内实体） | `id`、`catalogItemId`、`status`（AVAILABLE/LOANED/DISABLED）、`version` | 仅可用名额能分配；借出后关联唯一有效 Loan；释放时恢复可用。条目库存数由可用名额计数得出，不维护易失的重复计数。 |
 | `Loan`（聚合根） | `id`、`userId`、`catalogItemId`、`slotId`、状态、`borrowedAt`、`dueAt`、`returnedAt`、借阅资料快照、`version` | `returnAt(now)` 只可从有效状态执行；按 `now < dueAt` 判按时，否则逾期归还。有效状态派生为 `ACTIVE`/`OVERDUE`，完成状态为 `RETURNED`/`RETURNED_LATE`。 |
 | `ReaderAccount`（外部上下文投影） | `userId`、`accountStatus` | 仅代表资格查询结果；账户系统仍是账号状态权威来源。本期不实现账号注册/管理。 |
 | `LoanPolicy`（值对象/策略） | 同时借阅上限 5、期限 14 个本地自然日、应还日 23:59:00、馆区 ZoneId | 计算借阅到期时刻；所有参数配置化并验证。 |
@@ -52,9 +57,9 @@ PostgreSQL
 
 ### 关联关系与聚合边界
 
-- `CatalogItem 1 — N LoanSlot`；一条有效 `Loan` 占用一个 Slot；一个读者可拥有多条 Loan。
-- `Loan` 保存 `catalogItemId`、`slotId` 和历史快照，不将整个目录聚合加载进借阅事务。
-- 跨聚合约束（读者有效数、无逾期、同条目无有效 Loan、名额可用）由 `BorrowLoan` 应用用例在同一数据库事务内验证并借助唯一约束/锁保证。
+- `CatalogItem` 由 Catalog 拥有；Lending 侧以 `catalogItemId` 维护名额投影及多个 `LoanSlot`，不建立跨库外键；一条有效 `Loan` 占用一个 Slot，一个读者可拥有多条 Loan。
+- `Loan` 保存 `catalogItemId`、`slotId` 和历史快照，不将整个目录聚合加载进借阅事务。跨服务数据关联依赖稳定 ID 与事件版本。
+- 跨聚合约束（读者有效数、无逾期、同条目无有效 Loan、名额可用）均在 Lending 服务本地事务内验证并借助唯一约束/锁保证；Catalog 元数据只通过事件投影同步。
 - 有效借阅定义为 `returned_at IS NULL`；是否逾期在读时按馆区当前时刻派生，不依赖定时任务改写状态。
 
 ### 状态转移与领域事件 (State & Transitions)
@@ -74,13 +79,13 @@ Loan:         ACTIVE --[now >= dueAt，读时派生]--> OVERDUE
 
 ### 聚合根与业务一致性 (Aggregates & Consistency)
 
-借阅和归还都使用 PostgreSQL `READ COMMITTED` 事务，并以固定锁顺序降低死锁：先锁读者借阅状态行（可设 `reader_loan_guard(user_id)`，不存在时用 upsert 建立），再锁目录项，最后锁名额或 Loan。锁的获取顺序定义业务受理顺序；并发争用最后名额时，最先取得该条目/可用名额锁并完成全部条件校验的请求为唯一成功者。
+借阅和归还都使用 Lending DB PostgreSQL `READ COMMITTED` 本地事务，并以固定锁顺序降低死锁：先锁读者借阅状态行（可设 `reader_loan_guard(user_id)`，不存在时用 upsert 建立），再锁本地目录资格投影/条目锁，最后锁名额或 Loan。锁的获取顺序定义业务受理顺序；并发争用最后名额时，最先取得该条目/可用名额锁并完成全部条件校验的请求为唯一成功者。
 
-借阅事务：校验账号状态 → 锁读者 guard → 查逾期及有效数 → 查同条目有效 Loan → 锁定一条可用 Slot（`SELECT ... FOR UPDATE SKIP LOCKED` 或按 ID 有序锁定；不可静默跳过所有正在竞争的唯一名额并误报永久无库存）→ 校验条目上架 → 插入 Loan 快照 → Slot 改为 LOANED → 保存幂等结果 → commit。取得竞争锁后若名额已被占用，返回 `BOOK_UNAVAILABLE`。所有检查应使用受锁保护的最新状态。
+借阅流程：Gateway 验 JWT → Lending 通过 Identity 同步资格接口确认账号正常（超时/不可达 fail-closed 为 503）→ Lending 接受请求并在本地事务锁 reader guard → 查本地逾期及有效数/重复项 → 校验由 Catalog 事件同步的上架与元数据投影 → 锁定可用 Slot → 插入 Loan 快照、更新 Slot、存幂等结果和 Outbox → commit。身份资格接口应有严格超时和熔断；账号状态事件更新本地资格投影，投影超过配置的新鲜度阈值时禁止新借阅。Catalog 下架事件到达前存在短暂传播窗口，因此 Lending 借阅时仍需核验本地 `catalogVersion`；若业务要求下架绝不被传播延迟穿透，应在受理时向 Catalog 做带版本的同步可借授权检查并 fail-closed。最终库存判断完全在 Lending 本地，不发生跨服务扣库存事务。
 
-归还事务：以认证 userId 和 loanId 定位并锁定 Loan，确认所有权与有效状态；锁定对应 Slot；同一事务写入 `returnedAt`、终态并将 Slot 释放，保存幂等结果后提交。重复归还不能二次释放。任一失败抛出运行时应用异常并回滚完整事务。
+归还事务：以认证 userId 和 loanId 定位并锁定 Loan，确认所有权与有效状态；锁定对应 Slot；同一事务写入 `returnedAt`、终态并将 Slot 释放，保存幂等结果及 Outbox 后提交。事件发布失败由 Outbox Relay 重试，不回滚已提交借还；消费者以 eventId 去重并按聚合版本排序。重复归还不能二次释放。任一本地失败回滚完整事务。
 
-数据库兜底约束：`UNIQUE(user_id, catalog_item_id) WHERE returned_at IS NULL` 防重复有效借阅；Slot 状态约束及 `loan.slot_id` 唯一（仅有效借阅）防止一个名额多重占用；检查约束保证 `returned_at` 与终态一致。借阅 guard 串行化同一读者的额度/逾期检查；目录与 Slot 锁解决跨读者最后名额竞争。乐观 `version` 用于管理性元数据更新，借还核心路径采用行锁。
+数据库兜底约束：`UNIQUE(user_id, catalog_item_id) WHERE returned_at IS NULL` 防重复有效借阅；Slot 状态约束及 `loan.slot_id` 唯一（仅有效借阅）防止一个名额多重占用；检查约束保证 `returned_at` 与终态一致。借阅 guard 串行化同一读者的额度/逾期检查；目录与 Slot 锁解决跨读者最后名额竞争。乐观 `version` 用于投影更新，借还核心路径采用行锁。禁止以 Saga 补偿替代借还核心原子事务；跨服务只对非核心派生数据（搜索可借投影、分析、通知）采用可重试最终一致流程。
 
 ## 3. API 接口设计 (API Specification)
 
@@ -111,6 +116,16 @@ HTTP/1.1 200 OK
 
 状态码：`200`；`400 INVALID_QUERY`（关键词过长、未知筛选/排序或分页格式错误）；`401 UNAUTHENTICATED`（若部署策略要求浏览必须登录，否则公开浏览不返回该状态）；`500 INTERNAL_ERROR`。
 
+### 1a. 获取可用分类
+
+目录筛选所需的分类也是读者目录 API 的一部分：`GET /api/v1/categories?page=1&pageSize=100&sort=name_asc`。无需登录（若站点整体要求登录则由 Gateway 统一保护）。仅返回至少有一个上架条目的分类，避免向读者暴露内部分类维护状态。
+
+```json
+{"code":"OK","message":"success","timestamp":"2026-10-29T10:00:00+08:00","traceId":"tr-123a","data":{"items":[{"id":"cat_1","name":"文学","itemCount":18}],"page":1,"pageSize":100,"total":1,"sort":"name_asc,id_asc"}}
+```
+
+状态码：`200`；`400 INVALID_QUERY`；`500 INTERNAL_ERROR`。
+
 ### 2. 获取图书详情
 
 `GET /api/v1/books/{id}`。公开目录详情不展示借阅者信息；对历史移除条目的详情，只可经本人借阅记录访问，不由该公开路由泄露。
@@ -135,7 +150,7 @@ Request：
 {"code":"OK","message":"借阅成功","timestamp":"2026-10-29T10:00:00+08:00","traceId":"tr-125","data":{"id":"loan_01","catalogItemId":"bk_01","title":"示例书","creator":"作者甲","type":"EBOOK","borrowedAt":"2026-10-29T10:00:00+08:00","dueAt":"2026-11-11T23:59:00+08:00","status":"ACTIVE","activeLoanCount":1,"maxActiveLoans":5}}
 ```
 
-状态码：`201` 首次成功；同幂等键重放可返回原 `201`（带 `Idempotent-Replay: true`）；`400` `ACCOUNT_NOT_ELIGIBLE`、`OVERDUE_LOANS_EXIST`、`LOAN_LIMIT_EXCEEDED`、`DUPLICATE_ACTIVE_LOAN`、`BOOK_UNAVAILABLE`、`INVALID_REQUEST`；`401` 未登录；`404 BOOK_NOT_FOUND`；`409 IDEMPOTENCY_KEY_REUSED`；`422` 若采用语义校验映射时用于规则拒绝（全服务需统一选择，建议业务资格拒绝用 `409` 或 `422`，本设计错误表统一按 409）；`500` 系统错误。若事务提交成功但响应丢失，客户端以相同 key 重试取得同一响应。
+状态码：`201` 首次成功；同幂等键重放可返回原 `201`（带 `Idempotent-Replay: true`）；`400 INVALID_REQUEST`；`401 UNAUTHENTICATED`；`403 ACCOUNT_NOT_ELIGIBLE`；`404 BOOK_NOT_FOUND`；`409 OVERDUE_LOANS_EXIST`、`LOAN_LIMIT_EXCEEDED`、`DUPLICATE_ACTIVE_LOAN`、`BOOK_UNAVAILABLE`、`IDEMPOTENCY_KEY_REUSED`；`503 DEPENDENCY_UNAVAILABLE`；`500 INTERNAL_ERROR`。全篇采用同一映射，不使用 422。若事务提交成功但响应丢失，客户端以相同 key 重试取得同一响应。
 
 ### 4. 归还
 
@@ -150,7 +165,7 @@ Request：
 
 ### 5. 查询个人借阅记录
 
-`GET /api/v1/users/me/loans?status=ACTIVE&page=1&pageSize=20&sort=dueAt_asc`。使用 `/me` 避免客户端伪造 userId；如兼容既定路由 `GET /api/v1/users/{userId}/loans`，必须校验 path userId 等于认证主体，否则返回 `404`。支持 `ACTIVE`、`OVERDUE`、`COMPLETED`，未传状态时返回全部并按分组字段展示。
+`GET /api/v1/users/{userId}/loans?status=ACTIVE&page=1&pageSize=20&sort=dueAt_asc`。`userId` 必须与认证主体一致，否则返回 `404`，避免泄露用户存在性。支持 `ACTIVE`、`OVERDUE`、`COMPLETED`，未传状态时返回全部并按分组字段展示；也可使用别名 `/api/v1/users/me/loans`，由 Gateway 将 `me` 绑定为认证主体。
 
 ```json
 {"code":"OK","message":"success","timestamp":"2026-10-29T10:00:00+08:00","traceId":"tr-127","data":{"items":[{"id":"loan_01","catalogItemId":"bk_01","title":"示例书","creator":"作者甲","type":"EBOOK","catalogStatus":"ON_SHELF","borrowedAt":"2026-10-29T10:00:00+08:00","dueAt":"2026-11-11T23:59:00+08:00","returnedAt":null,"status":"ACTIVE","timeRemaining":{"kind":"DAYS_REMAINING","days":13},"actions":["RETURN"]}],"page":1,"pageSize":20,"total":1,"sort":"dueAt_asc,id_asc"}}
@@ -158,28 +173,69 @@ Request：
 
 状态码：`200`；`400 INVALID_QUERY`；`401 UNAUTHENTICATED`；`500 INTERNAL_ERROR`。剩余/逾期天数按馆区本地自然日规则计算；不足 24 小时且未到期返回 `kind=IMMINENT`，到期后逾期 0 天显示 `OVERDUE_DAYS, days=0`。
 
+### 6. 查询本人单条借阅记录
+
+`GET /api/v1/loans/{loanId}`。仅本人可查；用于历史详情和未知操作后核对最终借阅状态。即使目录条目下架或永久移除，返回借阅时保存的快照，仍有效时包含归还入口。
+
+```json
+{"code":"OK","message":"success","timestamp":"2026-10-29T10:00:00+08:00","traceId":"tr-128","data":{"id":"loan_01","catalogItemId":"bk_01","title":"示例书","creator":"作者甲","type":"EBOOK","catalogStatus":"REMOVED","borrowedAt":"2026-10-29T10:00:00+08:00","dueAt":"2026-11-11T23:59:00+08:00","returnedAt":null,"status":"ACTIVE","actions":["RETURN"]}}
+```
+
+状态码：`200`；`401 UNAUTHENTICATED`；`404 LOAN_NOT_FOUND`（不存在或非本人）；`500 INTERNAL_ERROR`。
+
+### 7. 查询借阅操作结果（网络结果未知时）
+
+`GET /api/v1/loan-operations/{idempotencyKey}`。仅限提交该操作的认证用户；key 是客户端 `Idempotency-Key`。重试 POST 时优先复用原 key；该 GET 供客户端轮询 pending 或找回已完成的原响应，不产生业务副作用。
+
+```json
+{"code":"OK","message":"success","timestamp":"2026-10-29T10:00:01+08:00","traceId":"tr-129","data":{"operationId":"6c0c…","state":"COMPLETED","httpStatus":201,"result":{"id":"loan_01","status":"ACTIVE"}}}
+```
+
+状态码：`200`（`state=PROCESSING|COMPLETED|REJECTED`）；`401 UNAUTHENTICATED`；`404 OPERATION_NOT_FOUND`；`400 INVALID_IDEMPOTENCY_KEY`；`500 INTERNAL_ERROR`。该查询是对 PRD 网络中断后查询同一操作结果的服务端支持。
+
+### 本期公开 API 清单
+
+| 服务 | Method / Path | 认证 | 用途 |
+|---|---|---|---|
+| Catalog | `GET /api/v1/categories` | 可匿名 | 获取可用分类筛选项 |
+| Catalog | `GET /api/v1/books` | 可匿名 | 检索、过滤、分页目录 |
+| Catalog | `GET /api/v1/books/{id}` | 可匿名 | 查询当前可访问条目详情 |
+| Lending | `POST /api/v1/loans` | 必须 | 借阅，要求 Idempotency-Key |
+| Lending | `POST /api/v1/loans/{id}/return` | 必须 | 归还，要求 Idempotency-Key |
+| Lending | `GET /api/v1/users/{userId}/loans` | 必须且本人 | 分页查询本人借阅列表 |
+| Lending | `GET /api/v1/loans/{id}` | 必须且本人 | 查询本人单条记录/历史快照 |
+| Lending | `GET /api/v1/loan-operations/{idempotencyKey}` | 必须且本人 | 查询操作是否完成及原结果 |
+
+本期不提供身份注册/登录、馆藏增删改/上下架/名额管理、续借、预约、罚金、通知、阅读内容访问 API。健康检查和指标端点仅集群内部使用，不属于读者业务 API：`/actuator/health/liveness`、`/actuator/health/readiness`、`/actuator/prometheus`，经网络策略限制访问。
+
 ## 4. 程序码结构与组织规范 (Code Organization)
 
 ```text
-src/main/java/com/example/elibrary/
-  shared/                 # Clock、ID、分页、错误模型、追踪
-  catalog/
+services/
+  api-gateway/             # 路由、认证、限流、OpenAPI 聚合，不放业务规则
+  catalog-service/
     api/                   # CatalogController、请求/响应 DTO
     application/           # BrowseCatalog、GetCatalogItem、查询端口
     domain/                # CatalogItem、LoanSlot、搜索规则、Repository 接口
     infrastructure/        # SQL Mapper、Repository 实现
-  lending/
+    db/migration/          # Catalog DB migrations
+  lending-service/
     api/                   # LoanController、Loan DTO
     application/           # BorrowLoan、ReturnLoan、ListReaderLoans
-    domain/                # Loan、LoanPolicy、LoanRepository、领域错误/事件
-    infrastructure/        # SQL 实现、锁、幂等存储
-  identity/
-    application/           # ReaderEligibilityPort
-    infrastructure/        # 身份/账号服务客户端适配器
-  bootstrap/               # Spring 配置、依赖装配、健康检查
-  error/                   # GlobalExceptionHandler、错误码到 HTTP 映射
+    domain/                # Loan、LoanSlot、LoanPolicy、Repository 接口、事件
+    infrastructure/        # Lending DB、锁、幂等、Outbox/Inbox、Broker adapter
+    db/migration/          # Lending DB migrations
+  identity-adapter/        # 对既有 Identity Service 的客户端与契约
+  contracts/               # OpenAPI、事件 schema、兼容性检查
+  platform/                # 本地开发 Compose、部署 chart、observability 配置
+```
+
+每个 service 的内层结构：
+
+```text
+src/main/java/.../{api,application,domain,infrastructure,config,error}
 src/main/resources/db/migration/
-src/test/java/...          # 对应模块测试
+src/test/java/.../{domain,application,adapter,contract,e2e}
 ```
 
 命名按业务能力而非技术层横向切分；Domain 包不引用 Spring/JPA 类型。Controller DTO 与领域对象分离，映射由 Mapper 负责。Repository 接口属于 Domain/Application 内侧，SQL 实现属于 Infrastructure。所有数据库迁移版本化，禁止生产环境自动建表。
@@ -220,11 +276,33 @@ src/test/java/...          # 对应模块测试
 
 ### 测试策略 (Testing Strategy)
 
-- Domain 单元测试：逾期边界 `now == dueAt`、本地自然日算法（月末/年末/夏令时）、额度和重复借阅、下架仍可归还、归还幂等状态行为。
-- Application 用例测试：依赖端口用 mock/fake，覆盖校验顺序、失败无副作用、幂等重放与异常传播。
-- Repository/集成测试：使用 Testcontainers PostgreSQL 验证 partial unique index、行锁、隔离、回滚、最后名额竞争和并发双归还只释放一次。不要仅以 H2 代替 PostgreSQL 并发语义。
-- API 契约测试：校验 OpenAPI、响应封装、认证主体隔离、错误码映射及分页稳定排序。
-- 端到端关键旅程：搜索 → 借阅 → 个人列表 → 归还 → 历史状态；此策略用于实现阶段持续运行。
+#### 测试分层与门禁
+
+- **Domain 单元测试**不启动 Spring；固定 Clock 和 ZoneId，边界值穷举。每个规则和状态转换必须有正向、拒绝、边界测试。
+- **Application 用例测试**用 fake/mock 端口验证步骤顺序、授权上下文、事务边界、幂等重放、依赖超时和错误映射。
+- **Adapter/集成测试**使用 Testcontainers PostgreSQL、Broker、OpenSearch（若启用）验证真实 SQL、消息确认/重试、索引投影。不能用 H2 替代并发与锁测试。
+- **契约测试**OpenAPI 与事件 schema 做兼容性检查；消费者驱动契约验证 Gateway、Catalog、Lending、Identity 之间的版本兼容。
+- **端到端/故障测试**在临时环境验证完整用户旅程及服务中断/恢复；发布门禁包含迁移兼容性、SLO smoke test、安全扫描。
+
+#### 业务与边界场景矩阵
+
+| 区域 | 必测场景 |
+|---|---|
+| 目录搜索 | 默认只上架；标题/作者/主编/主题子串命中；大小写与全半角规范化；首尾空格与纯空白；100 字符边界及 101 字符拒绝（不得截断）；分类/类型/可借状态交集；空结果；筛选后页码越界归最后页；相同上架时间标题及 ID 稳定排序；下架立即从结果移除；关键词特殊字符安全转义；索引更新延迟与 `availabilityAsOf`。 |
+| 详情 | 上架且有库存、零库存、下架、永久移除、无权访问；可选字段缺失不伪造；电子书 ISBN 与期刊卷期；历史快照可读；不返回其他读者数据。 |
+| 借阅规则 | 正常账号成功；冻结/注销/未核验拒绝；恰有 4 项成功、已有 5 项拒绝；存在一项/多项逾期拒绝；无逾期后恢复资格；同条目有效借阅拒绝、归还后可重借；条目下架/移除/零库存拒绝；每一失败均断言 Loan、Slot、额度均无变化。 |
+| 借阅时间 | 14 个本地自然日算法；借阅当天算第 1 日；跨月/跨年；闰日；夏令时跳变/重复时刻；应还时刻精确为 23:59:00；不同 JVM 默认时区计算结果相同。 |
+| 借阅并发 | 最后一个 Slot 的 N 路并发仅一成功；多 Slot 时成功数不超过 Slot 数；同 user 并发借不同条目不超过上限；同 user 同条目双请求只一条有效 Loan；不同读者可并行；死锁检测与有限重试；请求受理顺序/锁顺序验证；失败请求不排队且无副作用。 |
+| 幂等与网络故障 | 同 key 同 payload 重放原状态码/响应；同 key 不同 payload 返回 409；提交后响应丢失后重试不重复借阅；处理中状态查询；幂等记录过期策略；并发相同 key；客户端超时、Gateway 重试与断路器行为。 |
+| 归还 | 本人有效记录按时归还；`now == dueAt` 属逾期归还；逾期记录可归还；非本人/不存在统一 404；已归还拒绝；下架/移除条目仍可归还；同时双归还仅一次释放；失败注入验证 Loan 与 Slot 同时回滚；归还全部逾期项后限制解除，仍有逾期项则继续限制。 |
+| 借阅记录 | ACTIVE/OVERDUE/COMPLETED 分类正确；刚到期显示逾期 0 天；剩余自然日、少于 24h 显示即将到期；完成记录时间倒序；并列时间 ID 稳定排序；页边界无重无漏；只能访问本人；快照字段在 Catalog 删除后仍完整。 |
+| Catalog 服务 | 发布/更新/下架事件版本顺序；重复与乱序事件；重放恢复读模型；事件 schema 兼容；索引故障期间降级/告警；同步授权调用超时 fail-closed。 |
+| 分布式消息 | Outbox 与业务事务原子性；Broker 不可用时 Outbox 积压但核心借还成功；Relay 崩溃后重发；Inbox 去重；消费者重启和死信重放；重复/乱序/旧版本事件不回滚新投影；毒消息隔离与告警。 |
+| Identity/安全 | JWT 过期/签名错误/错误 issuer/audience；身份服务超时/熔断；资格投影过期 fail-closed；账号冻结事件传播；userId 伪造；越权读写；速率限制；注入、敏感信息日志脱敏。 |
+| 数据与恢复 | 向前/向后兼容迁移；备份恢复；服务重启后幂等可查；数据库主从切换；连接池耗尽；事务超时；时钟偏差监控；数据修复与审计。 |
+| 可观测性与性能 | Trace 跨 Gateway/服务/消息传播；指标标签不含高基数用户 ID；借还 p95/p99、错误率、锁等待与 Outbox lag；分页/搜索负载测试；突发并发与容量压测；readiness/liveness 正确区分依赖故障。 |
+
+关键 E2E：目录搜索 → 详情 → 借阅 → 网络超时以相同 key 查询/重试 → 本人借阅列表 → 到期投影 → 逾期归还 → 已完成历史；另覆盖下架后仍可归还和最后名额竞争。测试数据使用固定 Clock 与可控事件发布器，避免依赖真实等待到期。
 
 ### 可扩展性预留 (Extensibility)
 
