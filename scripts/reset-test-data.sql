@@ -1,7 +1,38 @@
 -- E-Library MVP 测试数据重置脚本
 -- 用法: docker exec -i library-service-mysql-1 mysql -uelibrary -pelibrary-local elibrary_db < scripts/reset-test-data.sql
 -- 基线: U1 无借阅 / U2 FROZEN / U3 2条逾期(1 ACTIVE + 1 RETURNED_LATE) / U4 借满5本
+-- 幂等: 账号/分类/条目用 INSERT ... ON DUPLICATE KEY UPDATE，可重复执行
 
+-- ========== 种子数据（幂等） ==========
+INSERT INTO accounts (account_id, status, eligibility_level, display_name, created_at, updated_at) VALUES
+  (UNHEX('00000000000000000000000000000001'), 'NORMAL', 'STANDARD', 'User One',   UTC_TIMESTAMP(6), UTC_TIMESTAMP(6)),
+  (UNHEX('00000000000000000000000000000002'), 'FROZEN', 'STANDARD', 'User Two',   UTC_TIMESTAMP(6), UTC_TIMESTAMP(6)),
+  (UNHEX('00000000000000000000000000000003'), 'NORMAL', 'STANDARD', 'User Three', UTC_TIMESTAMP(6), UTC_TIMESTAMP(6)),
+  (UNHEX('00000000000000000000000000000004'), 'NORMAL', 'STANDARD', 'User Four',  UTC_TIMESTAMP(6), UTC_TIMESTAMP(6))
+ON DUPLICATE KEY UPDATE status = VALUES(status), eligibility_level = VALUES(eligibility_level);
+
+INSERT INTO categories (category_id, name, status, sort_order, created_at, updated_at) VALUES
+  (UNHEX('0000000000000000000000000000000A'), 'Fiction',      'ACTIVE',   1, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6)),
+  (UNHEX('0000000000000000000000000000000C'), 'Science',      'ACTIVE',   2, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6)),
+  (UNHEX('0000000000000000000000000000000D'), 'Disabled Cat', 'DISABLED', 3, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6))
+ON DUPLICATE KEY UPDATE name = VALUES(name), status = VALUES(status), sort_order = VALUES(sort_order);
+
+INSERT INTO catalog_items (item_id, type, title, creator, category_id, search_text, shelf_status,
+                           total_copies, available_copies, published_at, created_at, updated_at) VALUES
+  (UNHEX('0000000000000000000000000000000B'), 'EBOOK', 'The Great Book', 'Author', UNHEX('0000000000000000000000000000000A'), 'the great book', 'ON_SHELF', 3, 3, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6), UTC_TIMESTAMP(6)),
+  (UNHEX('0000000000000000000000000000000C'), 'EBOOK', 'Out of Stock Book', 'Author', UNHEX('0000000000000000000000000000000A'), 'out of stock book', 'ON_SHELF', 0, 0, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6), UTC_TIMESTAMP(6)),
+  (UNHEX('0000000000000000000000000000000D'), 'PERIODICAL', 'Off Shelf Magazine', 'Author', UNHEX('0000000000000000000000000000000C'), 'off shelf magazine', 'OFF_SHELF', 5, 5, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6), UTC_TIMESTAMP(6)),
+  (UNHEX('0000000000000000000000000000000E'), 'EBOOK', 'Removed Book', 'Author', UNHEX('0000000000000000000000000000000C'), 'removed book', 'REMOVED', 2, 2, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6), UTC_TIMESTAMP(6)),
+  (UNHEX('0000000000000000000000000000000F'), 'EBOOK', 'Quantum Physics', 'Author', UNHEX('0000000000000000000000000000000C'), 'quantum physics', 'ON_SHELF', 2, 2, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6), UTC_TIMESTAMP(6)),
+  (UNHEX('00000000000000000000000000000010'), 'EBOOK', 'Book 10', 'Author', UNHEX('0000000000000000000000000000000A'), 'book 10', 'ON_SHELF', 1, 1, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6), UTC_TIMESTAMP(6)),
+  (UNHEX('00000000000000000000000000000011'), 'EBOOK', 'Book 11', 'Author', UNHEX('0000000000000000000000000000000A'), 'book 11', 'ON_SHELF', 1, 1, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6), UTC_TIMESTAMP(6)),
+  (UNHEX('00000000000000000000000000000012'), 'EBOOK', 'Book 12', 'Author', UNHEX('0000000000000000000000000000000A'), 'book 12', 'ON_SHELF', 1, 1, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6), UTC_TIMESTAMP(6)),
+  (UNHEX('00000000000000000000000000000013'), 'EBOOK', 'Book 13', 'Author', UNHEX('0000000000000000000000000000000A'), 'book 13', 'ON_SHELF', 1, 1, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6), UTC_TIMESTAMP(6)),
+  (UNHEX('00000000000000000000000000000016'), 'EBOOK', 'Conflict Test Book', 'Author', UNHEX('0000000000000000000000000000000A'), 'conflict test book', 'ON_SHELF', 1, 1, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6), UTC_TIMESTAMP(6))
+ON DUPLICATE KEY UPDATE title = VALUES(title), shelf_status = VALUES(shelf_status),
+                        total_copies = VALUES(total_copies), available_copies = VALUES(available_copies);
+
+-- ========== 重置动态数据 ==========
 DELETE FROM idempotency_records;
 DELETE FROM loans;
 UPDATE catalog_items SET available_copies = total_copies;

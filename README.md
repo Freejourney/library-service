@@ -81,6 +81,15 @@ docker compose up -d mysql jwk   # MySQL 8.4（:3306）+ JWK 服务器（HTTPS :
 ### 2. 本地启动三个服务（JVM）
 
 ```bash
+./scripts/start-services.sh   # 构建 + 启动三个服务（已运行则自动重启）
+```
+
+脚本自动完成：构建 jar、检测端口占用（已运行则先停止再重启）、启动三个服务、等待就绪并输出健康检查。
+
+> 环境变量默认值已内置（`DB_URL`/`DB_USERNAME`/`DB_PASSWORD`/`JWT_*`），如需覆盖可先 `export` 再运行。
+> 也可手动启动：
+
+```bash
 export DB_URL='jdbc:mysql://127.0.0.1:3306/elibrary_db?connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true'
 export DB_USERNAME=elibrary DB_PASSWORD=elibrary-local
 export JWT_ISSUER_URI=https://issuer.example.com JWT_AUDIENCE=elibrary-api
@@ -143,6 +152,7 @@ SERVICE=lending docker compose -f compose.test.yaml run --rm test
 
 ### 端到端场景验证（curl）
 
+**验收文档**：[docs/validation.md](./docs/validation.md) 提供 Quickstart 启动步骤 + 全场景 curl 命令与预期结果。
 覆盖全部 API 场景的 curl 调用文档见 [docs/curl-scenarios.md](./docs/curl-scenarios.md)，
 自动断言脚本为 `scripts/verify-scenarios.sh`（52 个场景，已全部验证通过）：
 
