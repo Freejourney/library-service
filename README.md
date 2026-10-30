@@ -2,6 +2,96 @@
 
 电子图书馆服务 MVP。**account / catalog / lending 三个独立 Spring Boot 服务**共享一个 `common` 工程，单 MySQL 数据库由 Flyway 管埋。读者身份取自已校验 JWT 的 `sub` 声明。
 
+## 目录
+
+- [架构](#架构)
+- [代码结构](#代码结构)
+- [服务描述与接口](#服务描述与接口)
+- [快速开始](#快速开始)
+- [配置项](#配置项)
+- [测试](#测试)
+- [构建](#构建)
+- [API 清单](#api-清单base-path-apiv1)
+- [已验证的端到端链路](#已验证的端到端链路)
+- [JWT / JWK 本地联调](#jwt--jwk-本地联调)
+- [需求场景与调用链](#需求场景与调用链)
+
+## 文档索引
+
+| 文档 | 说明 |
+|---|---|
+| [tech-mvp.md](./tech-mvp.md) | 核心技术方案：架构总览、数据模型、核心业务设计、API 契约、DDD、错误处理、代码可维护性、测试策略、交付部署、演进路线 |
+| [docs/validation.md](./docs/validation.md) | **验收文档**：Quickstart 启动步骤 + 全场景 curl 命令与预期结果 + 停止服务 |
+| [docs/curl-scenarios.md](./docs/curl-scenarios.md) | curl 场景测试明细：覆盖全部 API 场景的调用与预期 |
+| [README.md](./README.md) | 本文档：架构、服务接口、快速开始、配置、测试、构建、API 清单 |
+
+## 代码结构
+
+```text
+library-service/
+├── settings.gradle / build.gradle        # 多模块 Gradle 工程（common + 3 业务模块）
+├── compose.yaml                          # 本地开发：MySQL + JWK 服务器（Docker）
+├── compose.test.yaml                     # 测试环境：MySQL + 测试运行容器
+├── Dockerfile                            # 单服务镜像（--build-arg SERVICE）
+├── Dockerfile.test                       # 测试镜像
+├── docker/jwk/                           # 本地联调 JWK/JWT 服务器（Python HTTPS）
+│   ├── jwk_server.py                     #   /jwks 公钥 + /token 签发
+│   ├── Dockerfile / cert.pem / jwks.json / key.pem
+├── scripts/
+│   ├── setup-local.sh                    # 一键启动基础设施 + 证书 + JWT
+│   ├── start-services.sh                 # 构建并启动三服务（已运行则重启）
+│   ├── reset-test-data.sql               # 重置测试数据（含种子数据）
+│   └── verify-scenarios.sh               # 52 场景自动断言
+├── docs/
+│   ├── validation.md                     # 验收文档（Quickstart + 场景 curl + 预期）
+│   └── curl-scenarios.md                 # curl 场景测试明细
+│
+├── common/                               # 共享工程（契约/配置/基础设施）
+│   └── src/main/
+│       ├── java/com/elibrary/
+│       │   ├── common/                   # 统一响应/异常/分页、UUID、时间、TraceFilter
+│       │   └── config/                   # Security(JWT)、TimeConfig、LoanProperties、
+│       │                                 #   ElibraryCommonAutoConfiguration
+│       └── resources/
+│           ├── elibrary-common.yml       # 共享配置（数据源/JWT/MyBatis/借阅策略）
+│           ├── db/migration/V1__init.sql # Flyway 迁移（5 张表）
+│           └── META-INF/spring/          # AutoConfiguration 注册
+│
+├── account/                              # 账号服务（:8081）
+│   └── src/main/java/com/elibrary/account/
+│       ├── AccountApplication.java       # 启动类
+│       ├── api/                          # AccountController（GET /accounts/me）
+│       ├── application/                  # AccountApplicationService、AccountAccessPort、
+│       │                                 #   LoanCountPort、LoanCountReader
+│       ├── domain/                       # ReaderAccount、AccountStatus
+│       └── infrastructure/               # AccountMapper、AccountRepository、LoanCountMapper
+│
+├── catalog/                              # 目录服务（:8082）
+│   └── src/main/java/com/elibrary/catalog/
+│       ├── CatalogApplication.java       # 启动类
+│       ├── api/                          # BookController、CategoryController
+│       ├── application/                  # CatalogApplicationService、CatalogReadPort、
+│       │                                 #   CatalogInventoryPort/Service、SearchCriteria
+│       ├── domain/                       # CatalogItem、Category、ShelfStatus
+│       └── infrastructure/               # CatalogMapper、CatalogItemRepository
+│
+└── lending/                              # 借阅服务（:8083）
+    ├── src/main/java/com/elibrary/lending/
+    │   ├── LendingApplication.java       # 启动类（@Import account/catalog 实现）
+    │   ├── api/                          # LoanController、UserLoansController、OperationController
+    │   ├── application/                  # BorrowLoan、ReturnLoan、LoanQueryService、
+    │   │                                 #   IdempotencyService、LoanRepository、LendingPolicyService
+    │   ├── domain/                       # Loan、LoanPolicy、DueDateCalculator
+    │   └── infrastructure/               # LoanMapper、IdempotencyMapper
+    └── src/test/java/com/elibrary/lending/
+        ├── sqlite/                       # SQLite 功能测试（52 场景，无需 Docker）
+        ├── architecture/                 # ArchUnit 架构规则测试
+        └── domain/                       # DueDateCalculator 单元测试
+```
+
+> 分层约定（Clean Architecture）：`api`（HTTP 适配）→ `application`（用例/端口）→ `domain`（纯领域）→ `infrastructure`（MyBatis 实现）。
+> 依赖方向单向：`api → application → domain`，`infrastructure` 实现 `application` 定义的端口。
+
 ## 架构
 
 ```text
