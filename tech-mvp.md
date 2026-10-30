@@ -690,6 +690,44 @@ infrastructure (Mapper/Row/Repository) 实现 application 端口
 - 数据库账号最小权限；密钥由 Secret 注入，不入库不入代码。
 - 日志不记录 Token、完整个人信息；用户 ID 如需关联使用受控散列。
 
+### 7.1 JWT / JWK 认证机制
+
+**认证方式**：Spring Security OAuth2 Resource Server，`NimbusJwtDecoder` 校验 JWT 的签名、issuer、audience、exp；`sub` 声明作为 `accountId`，**不信任**请求体/路径中的读者 ID。
+
+**Token 从哪来（登录流程）**：登录/注册/凭证管理**不在 MVP 范围**，由 OIDC Provider（如 Keycloak）承接。读者在登录页完成认证后，OIDC Provider 签发 JWT（`sub` = 读者 ID），前端/客户端在后续请求中携带 `Authorization: Bearer <JWT>`。三个服务只负责**验证** token，不签发、不管理凭证。
+
+**密钥获取（二选一）**：
+
+| 配置 | 说明 |
+|---|---|
+| `JWT_ISSUER_URI` | OIDC issuer 发现：自动发现 JWK 端点（生产推荐） |
+| `JWT_JWK_SET_URI` | 固定 JWK 端点：直接指向 `https://.../jwks`（本地联调） |
+
+**校验链**：签名（RS256，按 `kid` 匹配 JWK）→ issuer → audience → exp。
+
+**匿名路径**：`GET /api/v1/categories`、`GET /api/v1/books`、`GET /api/v1/books/**` 及 actuator 健康检查匿名可访问；其余接口需 `Authorization: Bearer <JWT>`。
+
+### 7.2 本地联调（Docker JWK + JWT）
+
+生产环境由真实 OIDC Provider 提供 JWK 端点与登录签发；本地无 Provider 时，用 **Docker 中的 JWK 服务器**（自签名证书 + 静态 JWK 端点）闭环验证——`/token` 端点模拟 OIDC Provider 的登录签发，`/jwks` 端点模拟公钥分发。
+
+**一键启动**：`scripts/setup-local.sh` 完成全部准备（启动 MySQL + JWK 容器、导入证书到 JVM、签发测试 JWT 到 `/tmp/jwt-u1..u4.jwt`）：
+
+```bash
+./scripts/setup-local.sh
+```
+
+**JWK 服务器**（`docker/jwk/`，Python HTTPS 服务器，`compose.yaml` 的 `jwk` 服务）：
+
+| 端点 | 说明 |
+|---|---|
+| `GET https://localhost:9443/jwks` | JWK 公钥（服务校验 JWT 签名用） |
+| `GET https://localhost:9443/token` | 模拟登录签发测试 JWT（默认 `sub=U1`，可用 `?sub=<uuid>` 指定账号） |
+
+**启动服务**：设置 `JWT_ISSUER_URI=https://issuer.example.com`、`JWT_JWK_SET_URI=https://localhost:9443/jwks`、`JWT_AUDIENCE=elibrary-api`。
+
+> `docker/jwk/` 下的 `key.pem`/`cert.pem`/`jwks.json` 为**本地联调专用**（非生产密钥），随仓库提供保证开箱即用；生产密钥由 Secret 注入。
+
 **可观测**
 - JSON 结构化日志：`timestamp, level, service, traceId, requestId, userIdHash, operation, catalogItemId/loanId, resultCode, durationMs`。业务拒绝记 WARN，不记 ERROR。
 - 指标（Micrometer → Prometheus）：借还成功/拒绝计数（按错误码）、事务耗时、锁等待/死锁次数、API 延迟分位数、连接池使用率、当前逾期借阅数。避免 `userId` 等高基数标签。

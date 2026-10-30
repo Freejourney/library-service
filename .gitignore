@@ -8,3 +8,5 @@ out/
 *.iml
 .idea/
 /Backend_Take_Home_E_Library_Service Chinese.docx
+
+# 本地联调私钥（docker/jwk/key.pem 为本地联调专用，非生产密钥）

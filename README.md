@@ -63,13 +63,19 @@
 
 ## 快速开始
 
-> **Docker 方案**：`compose.yaml` 仅提供 MySQL 8.4（数据库用 Docker），三个服务在本地 JVM 启动。
+> **Docker 方案**：`compose.yaml` 提供 MySQL 8.4 与 JWK 服务器（本地联调用），三个服务在本地 JVM 启动。
 > 镜像构建（`Dockerfile`）仅用于生产部署，本地开发不构建镜像。
 
-### 1. 启动数据库（Docker）
+### 1. 一键启动基础设施（推荐）
 
 ```bash
-docker compose up -d mysql        # 启动 MySQL 8.4（端口 3306）
+./scripts/setup-local.sh   # 启动 MySQL + JWK 容器，导入证书，签发测试 JWT
+```
+
+或手动：
+
+```bash
+docker compose up -d mysql jwk   # MySQL 8.4（:3306）+ JWK 服务器（HTTPS :9443）
 ```
 
 ### 2. 本地启动三个服务（JVM）
@@ -78,6 +84,7 @@ docker compose up -d mysql        # 启动 MySQL 8.4（端口 3306）
 export DB_URL='jdbc:mysql://127.0.0.1:3306/elibrary_db?connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true'
 export DB_USERNAME=elibrary DB_PASSWORD=elibrary-local
 export JWT_ISSUER_URI=https://issuer.example.com JWT_AUDIENCE=elibrary-api
+export JWT_JWK_SET_URI=https://localhost:9443/jwks   # 本地联调 JWK 端点
 
 ./gradlew :account:bootRun --args='--server.port=8081'   # account  :8081
 ./gradlew :catalog:bootRun --args='--server.port=8082'   # catalog  :8082
@@ -85,6 +92,7 @@ export JWT_ISSUER_URI=https://issuer.example.com JWT_AUDIENCE=elibrary-api
 ```
 
 健康检查：`curl localhost:8081/actuator/health/readiness`（catalog/lending 同理）。
+JWT 签发与证书导入见 [JWT / JWK 本地联调](#jwt--jwk-本地联调)。
 
 ## 配置项
 
@@ -188,8 +196,44 @@ docker build --build-arg SERVICE=lending -t elibrary-lending .
 4. `GET /users/{userId}/loans` → 个人记录（馆区时区、剩余/逾期天数）
 5. `POST /loans/{id}/return` → 归还，库存回补
 
-> 本地联调 JWT：使用自签名 JWK 端点时，需将证书导入 JVM 信任库
-> （`keytool -import -trustcacerts -alias <name> -file <cert.pem> -keystore $JAVA_HOME/lib/security/cacerts`）。
+## JWT / JWK 本地联调
+
+三个服务通过 Spring Security OAuth2 Resource Server 校验 JWT（签名/issuer/audience/exp），`sub` 即 `accountId`。
+
+**登录与 token 获取**：登录/注册/凭证管理**不在 MVP 范围**，由 OIDC Provider（如 Keycloak）承接——读者登录后由 Provider 签发 JWT，客户端携带 `Authorization: Bearer <JWT>` 访问。三个服务只**验证** token，不签发、不管理凭证。本地无 Provider 时，用 **Docker 中的 JWK 服务器**（自签名证书 + 静态 JWK 端点）闭环验证：`/token` 模拟登录签发，`/jwks` 模拟公钥分发。
+
+### 一键启动（推荐）
+
+```bash
+./scripts/setup-local.sh
+```
+
+脚本自动完成：启动 MySQL + JWK 容器、导入证书到 JVM、签发测试 JWT 到 `/tmp/jwt-u1.jwt` ~ `/tmp/jwt-u4.jwt`（及 `/tmp/test.jwt`）。
+
+### JWK 服务器端点
+
+`compose.yaml` 的 `jwk` 服务（`docker/jwk/`，Python HTTPS 服务器）提供：
+
+| 端点 | 说明 |
+|---|---|
+| `GET https://localhost:9443/jwks` | JWK 公钥（服务校验 JWT 签名用） |
+| `GET https://localhost:9443/token` | 签发测试 JWT（默认 `sub=U1`，可用 `?sub=<uuid>` 指定账号） |
+
+```bash
+curl -sk https://localhost:9443/token                    # 获取 U1 的 JWT
+curl -sk "https://localhost:9443/token?sub=00000000-0000-0000-0000-000000000003"  # U3 的 JWT
+```
+
+### 启动服务
+
+```bash
+export JWT_ISSUER_URI=https://issuer.example.com
+export JWT_JWK_SET_URI=https://localhost:9443/jwks
+export JWT_AUDIENCE=elibrary-api
+```
+
+> `docker/jwk/` 下的 `key.pem`/`cert.pem`/`jwks.json` 为**本地联调专用**（非生产密钥），随仓库提供保证开箱即用；生产密钥由 Secret 注入。
+> 匿名路径：`GET /api/v1/categories`、`GET /api/v1/books`、`GET /api/v1/books/**` 及 actuator 健康检查。
 
 ## 需求场景与调用链
 
